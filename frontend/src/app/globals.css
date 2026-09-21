@@ -1,0 +1,81 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    @apply bg-canvas text-ink;
+    font-size: 14px;
+  }
+
+  /* Visible keyboard focus everywhere, per the accessibility brief. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-primary ring-offset-2 ring-offset-canvas;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-card border border-line bg-card shadow-card;
+  }
+
+  .card-header {
+    @apply border-b border-line px-6 py-5;
+  }
+
+  .card-title {
+    @apply text-[17px] font-semibold text-ink;
+  }
+
+  .card-subtitle {
+    @apply mt-0.5 text-[13px] text-ink-muted;
+  }
+
+  .section-heading {
+    @apply text-xl font-semibold text-ink;
+  }
+
+  .label-caps {
+    @apply text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-muted;
+  }
+
+  .chip {
+    @apply inline-flex items-center rounded-md bg-chip px-2 py-1 text-meta font-medium text-ink-soft;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-control px-4 py-2.5
+           text-sm font-semibold transition-colors disabled:cursor-not-allowed
+           disabled:opacity-60;
+  }
+
+  .btn-primary {
+    @apply btn bg-primary text-white hover:bg-primary-hover;
+  }
+
+  .btn-outline {
+    @apply btn border border-line bg-card text-ink-soft hover:bg-canvas;
+  }
+
+  .btn-danger {
+    @apply btn border border-danger-border bg-card text-danger hover:bg-danger-soft;
+  }
+
+  .table-head {
+    @apply label-caps px-6 py-3 text-left;
+  }
+
+  .table-cell {
+    @apply px-6 py-4 text-table text-ink-soft;
+  }
+
+  .field {
+    @apply w-full rounded-control border border-line bg-card px-3.5 py-2.5 text-sm
+           text-ink placeholder:text-ink-faint focus:border-primary focus:outline-none
+           focus:ring-1 focus:ring-primary;
+  }
+}

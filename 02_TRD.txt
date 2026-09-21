@@ -1,0 +1,280 @@
+DOCUMENT 02 — TRD
+TECHNICAL REQUIREMENTS DOCUMENT
+
+Project: Automated Audit Evidence Retrieval
+Version: 1.0
+
+1. TECHNICAL STACK
+
+Frontend:
+- Next.js with TypeScript.
+- React.
+- Tailwind CSS.
+Reason for choice: Next.js provides a structured application framework, routing, and a clean local development experience while retaining React. Business logic remains in FastAPI.
+
+Backend:
+- Python 3.11+
+- FastAPI
+- LangChain
+- LangGraph
+- Pydantic
+
+LLM:
+- Groq API using a free/available model at development time.
+- Model ID must be configurable through GROQ_MODEL and not hard-coded as an assumed permanent model.
+
+Data:
+- SQLite for source-system mocks.
+- Separate SQLite application-state DB is recommended.
+- Local filesystem for mock documents, evidence staging, and final packages.
+
+MCP:
+- MCP tool layer between Retrieval Agent and SQLite databases.
+- Agents should not directly embed database-specific connection logic.
+
+2. ARCHITECTURE
+
+Next.js
+  ↓
+FastAPI
+  ↓
+LangGraph Orchestrator
+  ↓
+Query Understanding Agent
+  ↓
+Parsed Query
+  ↓
+Requirement Catalog
+  ↓
+Retrieval Agent
+  ↓
+MCP Layer
+  ↓
+SQLite Mock Databases
+  ↓
+Evidence Staging
+  ↓
+Validation Engine
+  ↓
+Retry / Re-check
+  ↓
+Audit Package Generator
+  ↓
+Reviewer
+
+3. COMPONENT RESPONSIBILITIES
+
+Orchestrator:
+- Own workflow state.
+- Create request ID.
+- Call Query Understanding Agent.
+- Load requirement catalog.
+- Build retrieval task.
+- Call Retrieval Agent.
+- Trigger validation.
+- Decide retry/complete.
+- Generate/await review.
+
+Query Understanding Agent:
+- Understand natural language.
+- Classify to UC-01–UC-04/UNSUPPORTED.
+- Extract supported inputs.
+- Return schema-valid JSON.
+- Do not invent databases or audit rules.
+
+Requirement Catalog:
+- Deterministic source of required data/documents for each supported use case.
+- Configuration-first.
+
+Retrieval Agent:
+- Coordinate searches.
+- Track found/missing evidence.
+- Invoke MCP tools.
+- Search databases sequentially.
+- Use additional identifiers from retrieved metadata.
+- Return retrieval status.
+
+MCP Layer:
+- Expose database operations.
+- Normalize search results.
+- Keep DB implementation away from agent prompt logic.
+
+Validation Engine:
+- Check evidence completeness.
+- Check metadata and identifier match.
+- Return COMPLETE/INCOMPLETE/NEEDS_REVIEW.
+
+Evidence Staging:
+- Store request-specific copies.
+- Preserve traceability to source database/document IDs.
+
+Audit Package Generator:
+- Create final evidence directory and JSON summaries.
+
+Reviewer:
+- Approve or reject package in POC.
+
+4. GROQ CONFIGURATION
+
+Environment:
+GROQ_API_KEY=<secret>
+GROQ_MODEL=<model supported by current Groq account>
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+
+Do not hard-code secrets.
+
+5. QUERY OUTPUT CONTRACT
+
+{
+  "use_case_id": "UC-04",
+  "requirement": "Balance Confirmation Alternate Testing",
+  "search_parameters": {
+    "vendor_name": "ABC Ltd",
+    "invoice_number": "INV-12345"
+  },
+  "confidence": 0.97,
+  "ambiguities": []
+}
+
+FastAPI validates this output using Pydantic.
+
+6. MCP TOOL CONTRACTS
+
+Suggested tools:
+- search_sqlite_database
+- get_document_metadata
+- retrieve_document
+
+Generic search request:
+{
+  "database_id": "DB-01",
+  "required_evidence": ["INVOICE", "GRN"],
+  "search_parameters": {
+    "vendor_name": "ABC Ltd",
+    "invoice_number": "INV-12345"
+  }
+}
+
+Normalized response:
+{
+  "database_id": "DB-01",
+  "status": "SUCCESS",
+  "matches": [
+    {
+      "document_id": "DOC-001",
+      "document_type": "INVOICE",
+      "vendor_name": "ABC Ltd",
+      "invoice_number": "INV-12345",
+      "file_path": "mock_documents/invoices/INV-12345.pdf"
+    }
+  ]
+}
+
+7. DATABASE SEARCH STRATEGY
+
+The POC intentionally does NOT use evidence-to-system mapping.
+
+Instead:
+1. Get required evidence list from use case catalog.
+2. Search DB-01.
+3. Update found/missing.
+4. Search next DB only for missing items.
+5. Continue until complete or all configured DBs have been searched.
+6. Enrich search context using related IDs found in retrieved documents.
+
+Illustrative:
+required = {Invoice, PO, GRN, SES}
+found = {}
+for database in ordered_databases:
+    missing = required - found
+    if not missing:
+        break
+    search database for missing evidence
+    add matches to found
+    add strong identifiers discovered to search context
+
+8. ADDITIONAL SEARCH KEYS
+
+Initial keys come from the query.
+Example:
+Vendor = ABC Ltd
+Invoice = INV-12345
+
+Retrieved invoice may reveal:
+PO = PO-5678
+Vendor ID = V001
+GRN = GRN-999
+
+These can be added to workflow state and used for later database searches.
+
+9. STORAGE
+
+mock_documents/
+evidence_staging/{request_id}/
+final_audit_packages/{request_id}/
+
+Original source documents must remain unchanged.
+
+10. API ENDPOINTS
+
+POST /api/audit-requests
+Creates request from raw query.
+
+GET /api/audit-requests/{request_id}
+Returns current request/workflow state.
+
+POST /api/audit-requests/{request_id}/run
+Starts/continues graph execution.
+
+POST /api/audit-requests/{request_id}/retry
+Retries missing evidence.
+
+POST /api/audit-requests/{request_id}/review
+Approve/reject reviewer action.
+
+GET /api/audit-requests/{request_id}/package
+Returns package metadata.
+
+GET /api/use-cases
+Returns supported POC use cases.
+
+11. ERROR STATES
+INVALID_INPUT
+UNSUPPORTED_QUERY
+QUERY_PARSE_FAILED
+DATABASE_UNAVAILABLE
+RETRIEVAL_ERROR
+DOCUMENT_NOT_FOUND
+VALIDATION_INCOMPLETE
+REVIEW_REQUIRED
+COMPLETE
+ERROR
+
+12. LOGGING
+For each request record:
+- request_id
+- timestamp
+- raw query
+- parsed JSON
+- use case
+- search parameters
+- database attempts
+- documents found
+- missing documents
+- retry count
+- validation result
+- final status
+
+Do not log secrets.
+
+13. TECHNICAL CONSTRAINTS
+- Local only.
+- SQLite mocks.
+- Synthetic data.
+- Groq for LLM.
+- All DB access through MCP.
+- LangGraph controls workflow/state.
+- LangChain handles LLM integration.
+- Pydantic validates contracts.
+- No authentication.
+- No hosting/deployment.

@@ -1,0 +1,33 @@
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Node / Next.js -------------------------------------------------------
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# --- Environment / secrets ------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Runtime state & generated artifacts ----------------------------------
+backend/app_state.sqlite
+backend/evidence_staging/
+backend/final_audit_packages/
+backend/test_input_results.json
+
+# --- OS / editor ----------------------------------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
