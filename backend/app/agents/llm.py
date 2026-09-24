@@ -1,0 +1,144 @@
+"""LLM provider abstraction (configuration-driven, TRD §2).
+
+`rules`     — deterministic built-in agents (no external calls).
+`groq`      — ChatGroq with GROQ_API_KEY (default model openai/gpt-oss-120b).
+`langchain` — any provider supported by LangChain's init_chat_model, e.g. AEP_LLM_MODEL="openai:gpt-4.1".
+
+Outputs are always validated against controlled values (the Requirement Catalog); any failure
+falls back to the rules engine so the workflow never depends on the LLM being available.
+Every LLM call and every rules-based fallback is reported through the generic observability API.
+"""
+import logging
+from typing import Literal
+
+from observability import get_observability
+from pydantic import BaseModel, Field, create_model
+
+from app.core.config import get_settings
+
+log = logging.getLogger(__name__)
+
+_model_override = None  # tests inject a fake chat model here
+
+
+def llm_enabled() -> bool:
+    s = get_settings()
+    if _model_override is not None:
+        return True
+    if s.llm_provider == "groq":
+        return bool(s.groq_api_key)
+    return s.llm_provider == "langchain" and bool(s.llm_model)
+
+
+def set_chat_model(model) -> None:
+    global _model_override, _cached
+    _model_override = model
+    _cached = None
+
+
+_cached = None
+
+QU_COMPONENT = "query_understanding_agent"
+QU_OPERATION = "structured_query_generation"
+
+
+def llm_identity() -> tuple[str, str]:
+    """(provider, model) of the configured chat model, for telemetry only."""
+    s = get_settings()
+    if _model_override is not None:
+        m = _model_override
+        return "custom", str(getattr(m, "model_name", None) or getattr(m, "model", None) or type(m).__name__)
+    if s.llm_provider == "langchain":
+        provider, _, name = s.llm_model.partition(":")
+        return (provider, name) if name else ("langchain", s.llm_model)
+    return s.llm_provider, s.llm_model
+
+
+def get_chat_model():
+    """Base chat model (supports .with_structured_output and .bind_tools)."""
+    global _cached
+    if _model_override is not None:
+        return _model_override
+    if _cached is None:
+        s = get_settings()
+        if s.llm_provider == "groq":
+            from langchain_groq import ChatGroq
+            _cached = ChatGroq(model=s.llm_model, api_key=s.groq_api_key, temperature=0,
+                               timeout=s.llm_timeout_seconds, max_retries=2)
+        else:
+            from langchain.chat_models import init_chat_model
+            _cached = init_chat_model(s.llm_model, temperature=0, timeout=s.llm_timeout_seconds)
+    return _cached
+
+
+class LlmQueryExtraction(BaseModel):
+    """Structured interpretation of an audit evidence request."""
+    query_type: str | None = Field(None, description="Best matching supported query type code, or null if unclear")
+    classification_rationale: str = Field("", description="One sentence explaining the query type choice")
+    ambiguous_between: list[str] = Field(default_factory=list,
+                                         description="Only if the request fits two or more supported types equally well")
+    payment_document_number: str | None = Field(None, description="10-digit payment document number if present")
+    invoice_number: str | None = Field(None, description="Invoice number (e.g. INV-2026-08455) if present")
+    po_number: str | None = Field(None, description="Purchase order number if present")
+    vendor_id: str | None = Field(None, description="Vendor ID if present")
+    employee_id: str | None = Field(None, description="Employee ID (e.g. E-20413) if present")
+    fiscal_year: str | None = Field(None, description="Fiscal year as 4 digits, only if explicitly stated (FY2026 -> 2026)")
+    period_start: str | None = Field(None, description="ISO date for start of the audit period if present")
+    period_end: str | None = Field(None, description="ISO date for end of the audit period if present")
+
+
+def _schema_for(supported: list[str]) -> type[BaseModel]:
+    """Constrain query_type to the catalog's codes so the model cannot invent or combine types."""
+    return create_model(
+        "AuditQueryExtraction", __base__=LlmQueryExtraction,
+        query_type=(Literal[tuple(supported)] | None, Field(None, description="One supported query type code, or null")),  # type: ignore[valid-type]
+        ambiguous_between=(list[Literal[tuple(supported)]], Field(  # type: ignore[valid-type]
+            default_factory=list, description="Only if the request fits two or more supported types equally well")),
+    )
+
+
+SYSTEM_PROMPT = (
+    "You are the Query Understanding and Query Type Classification agent of an internal audit evidence platform. "
+    "Extract business identifiers that literally appear in the auditor's request, and choose exactly ONE query type "
+    "from the supported list (or null when none fits). If it fits several types equally, list them in ambiguous_between. "
+    "Never invent identifiers, evidence requirements or source systems."
+)
+
+
+def llm_extract(text: str, supported: dict[str, str] | None = None) -> LlmQueryExtraction | None:
+    """`supported` maps query type code -> description of what it covers (from the Requirement Catalog)."""
+    return llm_extract_detailed(text, supported)[0]
+
+
+def llm_extract_detailed(text: str, supported: dict[str, str] | None = None
+                         ) -> tuple[LlmQueryExtraction | None, str | None]:
+    """(extraction, fallback_reason). `fallback_reason` is None when the LLM result is usable, otherwise
+    "llm_disabled" | "llm_error" and the caller continues with the rules engine."""
+    obs = get_observability()
+    if not llm_enabled():
+        obs.log_fallback_started(component=QU_COMPONENT, operation=QU_OPERATION, fallback_type="rules_based",
+                                 reason="llm_disabled")
+        return None, "llm_disabled"
+    supported = supported or {}
+    provider, model_name = llm_identity()
+    try:
+        catalog = "\n".join(f"- {code}: {desc}" for code, desc in supported.items()) or "- (none)"
+        schema = _schema_for(list(supported)) if supported else LlmQueryExtraction
+        messages = [("system", f"{SYSTEM_PROMPT}\n\nSupported query types:\n{catalog}"), ("human", text)]
+        with obs.llm_call(component=QU_COMPONENT, operation=QU_OPERATION, provider=provider, model=model_name) as call:
+            call.set_messages(messages)
+            model = get_chat_model().with_structured_output(schema)
+            out = model.invoke(messages)
+            if isinstance(out, dict):
+                out = schema(**out)
+            if out.query_type and supported and out.query_type not in supported:
+                out.query_type = None
+            result = LlmQueryExtraction(**out.model_dump())
+            call.set_output(result.model_dump())
+            call.set_parsed(True)
+        return result, None
+    except Exception as exc:  # provider/network/validation failure -> deterministic fallback
+        log.warning("LLM extraction failed; falling back to rules", exc_info=True)
+        obs.log_fallback_started(component=QU_COMPONENT, operation=QU_OPERATION, fallback_type="rules_based",
+                                 reason="llm_error", error=exc, provider=provider, model=model_name)
+        return None, "llm_error"

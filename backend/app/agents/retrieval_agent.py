@@ -1,445 +1,177 @@
-"""Retrieval Agent.
+"""Retrieval Agent: executes the retrieval plan through MCP only.
 
-Coordinates the sequential, multi-database evidence search. It knows nothing
-about which system holds which evidence: it walks the configured sources in
-order, asks each one only for what is still missing, and folds any strong
-identifiers it discovers into the search context so later sources can be
-queried with keys the original request never contained.
-
-All data access goes through the MCP client - this module never imports
-sqlite3.
+Keys come from the Evidence Source Registry. A key value is taken from a previously retrieved record only when the
+registry documents that dependency ("PO Number [from INVOICE]") — no undocumented chains. Also handles alternative /
+corroborating sources (Source Usage rule), identifier mismatches and bounded retries on source failures.
 """
-
-from __future__ import annotations
-
-import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 
-from app.catalog.loader import enabled_databases, get_use_case
-from app.config import get_settings
-from app.mcp_layer.client import open_mcp_client
-from app.services import repository, staging, tabular
+from observability import get_observability
 
-logger = logging.getLogger(__name__)
+from app.core.config import get_settings
+from app.core.models import RetrievalPlan
+from app.mcp.connectors import ConnectorResult
+from app.mcp.gateway import McpGateway
 
-ProgressHook = Callable[[dict[str, Any]], Awaitable[None]] | None
-
-# Evidence compiled from several systems has no single source database.
-GENERATED_SOURCE_ID = "GENERATED"
-
-# Identifier columns copied onto each evidence record. The Validation Engine
-# compares these against the auditor's stated parameters, so they have to
-# travel with the evidence rather than staying behind in the source row.
-_EVIDENCE_FIELDS = (
-    "vendor_id", "vendor_name", "invoice_number", "po_number", "grn_number",
-    "ses_number", "account_number", "sob", "nac_code", "period", "report_type",
-)
+log = logging.getLogger(__name__)
 
 
 @dataclass
-class RetrievalOutcome:
-    """Result of one retrieval pass."""
-
-    found: dict[str, dict[str, Any]] = field(default_factory=dict)
-    missing: list[str] = field(default_factory=list)
-    attempts: list[dict[str, Any]] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
-
-    # Search context after enrichment, carried into the next pass.
-    context: dict[str, Any] = field(default_factory=dict)
-    # identifier key -> database that revealed it (e.g. ses_number -> DB-04).
-    identifier_origin: dict[str, str] = field(default_factory=dict)
-    # evidence code -> database whose identifier unlocked it.
-    unlocked_by: dict[str, str] = field(default_factory=dict)
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "found": self.found,
-            "missing": self.missing,
-            "attempts": self.attempts,
-            "errors": self.errors,
-            "identifier_origin": self.identifier_origin,
-            "unlocked_by": self.unlocked_by,
-        }
+class RawEvidence:
+    """Structured output of the Retrieval Agent for one required evidence type."""
+    evidence_type: str
+    found: bool
+    step: RetrievalPlan | None = None
+    result: ConnectorResult | None = None
+    keys_used: dict[str, Any] = field(default_factory=dict)
+    attempts: int = 0
+    reason: str | None = None
+    source_error: bool = False
+    notes: list[str] = field(default_factory=list)
+    corroboration: list[dict[str, Any]] = field(default_factory=list)
+    planned_source: str | None = None
 
 
-async def _pace() -> None:
-    """Pause between sources so the sequential search is visible in the UI."""
-    delay_ms = get_settings().demo_step_delay_ms
-    if delay_ms > 0:
-        await asyncio.sleep(delay_ms / 1000.0)
+def key_value(step: RetrievalPlan, param: str, context: dict[str, Any], derived: dict[tuple[str, str], Any]):
+    """Request value, else a value derived from evidence — only if this step's registry row documents it."""
+    if context.get(param) not in (None, ""):
+        return context[param]
+    source_type = step.derived.get(param)
+    return derived.get((source_type, param)) if source_type else None
 
 
-async def retrieve_evidence(
-    request_id: str,
-    use_case_id: str,
-    required_evidence: list[str],
-    search_context: dict[str, Any],
-    *,
-    already_found: dict[str, dict[str, Any]] | None = None,
-    identifier_origin: dict[str, str] | None = None,
-    scope_context: dict[str, Any] | None = None,
-    tabular_filters: dict[str, Any] | None = None,
-    pass_number: int = 1,
-    progress: ProgressHook = None,
-) -> RetrievalOutcome:
-    """Search the configured databases in order for the required evidence.
-
-    Args:
-        required_evidence: evidence codes still wanted for this pass.
-        search_context: MCP-facing search parameters, enriched as we go.
-        already_found: evidence located by earlier passes, so it is skipped.
-        identifier_origin: where previously discovered identifiers came from.
-        scope_context: the auditor's STATED scope, never enriched. Aggregate
-            evidence must be compiled against this rather than the enriched
-            context: an identifier discovered mid-run (a vendor id harvested
-            from one row) would silently narrow the population, turning a
-            full transaction listing into an arbitrary subset of itself.
-        tabular_filters: extra exact-match narrowing for compiled evidence
-            only, on columns the shared matcher ignores. An AP cost drill
-            still requires the AP, AR and Others report DOCUMENTS, so the
-            matcher cannot filter on report_type - but the transaction
-            listing behind that request should hold AP lines only.
-        pass_number: 1 for the initial pass, 2+ for retries.
-    """
-    outcome = RetrievalOutcome(
-        found=dict(already_found or {}),
-        context=dict(search_context),
-        identifier_origin=dict(identifier_origin or {}),
-    )
-    spec = get_use_case(use_case_id)
-
-    # Human-judgement items can never be satisfied by a search, and generated
-    # items are compiled from row data rather than found as documents.
-    human_required = {item.code for item in (spec.evidence if spec else []) if item.human_required}
-    generated = {item.code for item in (spec.evidence if spec else []) if item.generated}
-    searchable = [
-        code
-        for code in required_evidence
-        if code not in human_required and code not in generated
-    ]
-    wanted_generated = [code for code in required_evidence if code in generated]
-
-    async with open_mcp_client() as client:
-        for database in enabled_databases():
-            wanted = [code for code in searchable if code not in outcome.found]
-            if not wanted:
-                logger.info("Nothing outstanding; skipping %s", database.database_id)
+def resolve_keys(step: RetrievalPlan, context: dict[str, Any],
+                 derived: dict[tuple[str, str], Any] | None = None) -> dict[str, Any] | None:
+    """One value per key group (first alternative available), or None if any group is unsatisfied."""
+    keys = {}
+    for group in step.key_groups or [[k] for k in step.key_names]:
+        for p in group:
+            v = key_value(step, p, context, derived or {})
+            if v not in (None, ""):
+                keys[p] = v
                 break
+        else:
+            return None
+    return keys
 
-            if progress:
-                await progress(
-                    {
-                        "event": "database_search_started",
-                        "database_id": database.database_id,
-                        "database_name": database.name,
-                        "requested_evidence": wanted,
-                        "pass_number": pass_number,
-                    }
-                )
-            await _pace()
 
-            attempt_id = repository.start_retrieval_attempt(
-                request_id=request_id,
-                database_id=database.database_id,
-                search_parameters=outcome.context,
-                requested_evidence=wanted,
-                pass_number=pass_number,
-            )
+def derivable_by_type(plan: list[RetrievalPlan]) -> dict[str, set[str]]:
+    """Evidence type -> params that the registry says may be taken from its retrieved record."""
+    out: dict[str, set[str]] = {}
+    for step in plan:
+        for param, source_type in step.derived.items():
+            out.setdefault(source_type, set()).add(param)
+    return out
 
-            result = await client.search_database(database.database_id, wanted, outcome.context)
 
-            if result.get("status") != "SUCCESS":
-                message = result.get("error_message") or "Search failed."
-                error_code = result.get("error_code") or "ERROR"
-                outcome.errors.append(f"{database.database_id}: {message}")
-                repository.complete_retrieval_attempt(attempt_id, 0, error_code, message)
-                outcome.attempts.append(
-                    {
-                        "database_id": database.database_id,
-                        "status": error_code,
-                        "result_count": 0,
-                        "requested_evidence": wanted,
-                        "newly_found": [],
-                        "error_message": message,
-                        "pass_number": pass_number,
-                    }
-                )
-                if progress:
-                    await progress(
-                        {
-                            "event": "database_search_failed",
-                            "database_id": database.database_id,
-                            "error_message": message,
-                            "pass_number": pass_number,
-                        }
-                    )
-                # A single unavailable source must not abort the whole run.
+def _label(param: str) -> str:
+    return param.replace("_", " ").title().replace("Po ", "PO ").replace("Id", "ID")
+
+
+class RetrievalAgent:
+    def __init__(self, gateway: McpGateway):
+        self.gateway = gateway
+        self.max_attempts = max(1, get_settings().retrieval_max_attempts)
+
+    def _call(self, step: RetrievalPlan, keys: dict[str, Any]) -> tuple[ConnectorResult, int]:
+        tool = McpGateway.tool_name(step.source_system)
+        args = {"operation": step.endpoint, "keys": keys, "include_documents": True, "request_id": step.request_id}
+        attempts = 1
+        res = self.gateway.call_tool(tool, args)
+        while not res.ok and res.source_error and attempts < self.max_attempts:
+            attempts += 1
+            with get_observability().retry(component="retrieval_agent", operation=tool, retry_number=attempts - 1,
+                                           reason="source_error", previous_error_type=res.error_kind,
+                                           evidence_type=step.evidence_type, source_system=step.source_system) as retry:
+                res = self.gateway.call_tool(tool, args)
+                retry.set_outcome("success" if res.ok else ("source_error" if res.source_error else "not_found"))
+        return res, attempts
+
+    def execute(self, plan: list[RetrievalPlan], parameters: dict[str, Any]) -> tuple[list[RawEvidence], list[str]]:
+        context = {k: v for k, v in parameters.items() if v not in (None, "")}
+        user_supplied = dict(context)
+        derived: dict[tuple[str, str], Any] = {}  # (source evidence type, param) -> value
+        derivable = derivable_by_type(plan)
+        warnings: list[str] = []
+        by_type: dict[str, list[RetrievalPlan]] = {}
+        for step in plan:
+            by_type.setdefault(step.evidence_type, []).append(step)
+
+        outcomes: dict[str, RawEvidence] = {}
+        pending = list(by_type)
+        progress = True
+        while pending and progress:
+            progress = False
+            for et in list(pending):
+                steps = by_type[et]
+                candidates = [s for s in steps if s.role == "primary"] + [s for s in steps if s.role == "alternative"]
+                if not any(resolve_keys(s, context, derived) for s in candidates):
+                    continue  # keys not yet known; a documented dependency may still provide them
+                pending.remove(et)
+                progress = True
+                outcomes[et] = self._retrieve_type(et, candidates, [s for s in steps if s.role == "corroborating"],
+                                                   context, derived, user_supplied, warnings, derivable)
+
+        for et in pending:  # keys never became available
+            steps = by_type[et]
+            src = next((s.source_system for s in steps if s.role == "primary"), steps[0].source_system if steps else None)
+            step = next((s for s in steps if s.role == "primary"), steps[0] if steps else None)
+            missing = [" or ".join(_label(p) for p in g) for g in (step.key_groups if step else [])
+                       if not any(key_value(step, p, context, derived) for p in g)]
+            dep = next((f" (expected from {s.derived[p]})" for s in steps for g in s.key_groups for p in g
+                        if p in s.derived and not key_value(s, p, context, derived)), "")
+            outcomes[et] = RawEvidence(et, False, reason=f"Missing in {src} · required key {', '.join(missing)} not available{dep}",
+                                       planned_source=src)
+        return [outcomes[et] for et in by_type if et in outcomes], warnings
+
+    def _retrieve_type(self, et, candidates, corroborating, context, derived, user_supplied, warnings,
+                       derivable) -> RawEvidence:
+        last: RawEvidence | None = None
+        primary_src = candidates[0].source_system if candidates else None
+        for step in candidates:
+            keys = resolve_keys(step, context, derived)
+            if keys is None:
                 continue
+            res, attempts = self._call(step, keys)
+            if res.ok and res.records:
+                raw = RawEvidence(et, True, step=step, result=res, keys_used=keys, attempts=attempts, planned_source=primary_src)
+                if step.role == "alternative":
+                    raw.notes.append(f"Retrieved from alternative source {step.source_system} ({last.reason if last else 'primary unavailable'})")
+                self._harvest(res, et, derived, user_supplied, raw, warnings, derivable.get(et, set()))
+                for c in corroborating:
+                    ckeys = resolve_keys(c, context, derived)
+                    if ckeys:
+                        cres, _ = self._call(c, ckeys)
+                        raw.corroboration.append({
+                            "source_system": c.source_system, "matched": bool(cres.ok and cres.records),
+                            "reference": str(cres.records[0].get(cres.reference_field)) if cres.ok and cres.records else None,
+                        })
+                return raw
+            key_desc = " · ".join(f"{v}" for v in keys.values())
+            if res.source_error:
+                reason = f"{step.source_system} unavailable after {attempts} attempt(s) · retry possible"
+            else:
+                reason = f"Missing in {step.source_system} · no record for {key_desc}"
+            last = RawEvidence(et, False, step=step, result=res, keys_used=keys, attempts=attempts,
+                               reason=reason, source_error=res.source_error, planned_source=primary_src)
+        return last or RawEvidence(et, False, reason="No applicable source mapping", planned_source=primary_src)
 
-            newly_found = await _absorb_matches(
-                client, request_id, database.database_id, result, outcome, pass_number
-            )
-            _enrich_context(database.database_id, result, outcome)
-
-            repository.complete_retrieval_attempt(
-                attempt_id, len(result.get("matches", [])), "COMPLETED", None
-            )
-            outcome.attempts.append(
-                {
-                    "database_id": database.database_id,
-                    "status": "COMPLETED",
-                    "result_count": len(result.get("matches", [])),
-                    "requested_evidence": wanted,
-                    "newly_found": newly_found,
-                    "error_message": None,
-                    "pass_number": pass_number,
-                }
-            )
-
-            if progress:
-                await progress(
-                    {
-                        "event": "database_search_completed",
-                        "database_id": database.database_id,
-                        "result_count": len(result.get("matches", [])),
-                        "newly_found": newly_found,
-                        "pass_number": pass_number,
-                    }
-                )
-
-        # --- generated evidence -------------------------------------------
-        # Compiled from transaction rows across every source, using the same
-        # search context, so the extract is scoped exactly like the documents.
-        for code in wanted_generated:
-            if code in outcome.found:
+    @staticmethod
+    def _harvest(res: ConnectorResult, evidence_type: str, derived, user_supplied, raw: RawEvidence,
+                 warnings: list[str], allowed: set[str]) -> None:
+        """Record only the identifiers the registry declares as derivable from this evidence type."""
+        record = res.records[0]
+        for key in sorted(allowed):
+            val = record.get(key)
+            if val in (None, ""):
                 continue
-            if progress:
-                await progress(
-                    {
-                        "event": "generating_evidence",
-                        "evidence_code": code,
-                        "pass_number": pass_number,
-                    }
-                )
-            await _compile_tabular_evidence(
-                client,
-                request_id,
-                spec,
-                code,
-                outcome,
-                pass_number,
-                scope=dict(scope_context if scope_context is not None else search_context),
-                filters=dict(tabular_filters or {}),
-            )
-
-    outcome.missing = [code for code in required_evidence if code not in outcome.found]
-    return outcome
-
-
-async def _compile_tabular_evidence(
-    client,
-    request_id: str,
-    spec,
-    code: str,
-    outcome: RetrievalOutcome,
-    pass_number: int,
-    scope: dict[str, Any],
-    filters: dict[str, Any],
-) -> None:
-    """Build a spreadsheet of the row-level data behind this request.
-
-    Rows are gathered from every configured source through MCP, then written
-    as a single workbook into staging. From there the item is indistinguishable
-    from a retrieved document: it validates, stages and packages the same way.
-    """
-    databases = enabled_databases()
-    names = {database.database_id: database.name for database in databases}
-
-    rows: list[dict[str, Any]] = []
-    for database in databases:
-        attempt_id = repository.start_retrieval_attempt(
-            request_id=request_id,
-            database_id=database.database_id,
-            search_parameters={**scope, **filters},
-            requested_evidence=[code],
-            pass_number=pass_number,
-        )
-        result = await client.fetch_transactions(database.database_id, scope, filters)
-        if result.get("status") != "SUCCESS":
-            message = result.get("error_message") or "Transaction fetch failed."
-            outcome.errors.append(f"{database.database_id}: {message}")
-            repository.complete_retrieval_attempt(
-                attempt_id, 0, result.get("error_code") or "ERROR", message
-            )
-            continue
-
-        found_rows = result.get("rows", [])
-        rows.extend(found_rows)
-        repository.complete_retrieval_attempt(attempt_id, len(found_rows), "COMPLETED", None)
-
-    if not rows:
-        # Nothing to compile: leave the item missing so validation reports it.
-        logger.info("No transaction rows matched for %s", code)
-        return
-
-    label = spec.label_for(code) if spec else code
-    identifier = _tabular_identifier({**scope, **filters})
-    filename = staging.staged_filename(code, identifier, ".xlsx")
-
-    built = tabular.build_transaction_workbook(
-        request_id,
-        label=label,
-        filename=filename,
-        rows=rows,
-        search_parameters={**scope, **filters},
-        database_names=names,
-        parameter_labels=spec.parameter_labels if spec else {},
-    )
-
-    metadata = {
-        **{key: scope.get(key) for key in ("period", "sob", "nac_code")},
-        "nac_code": scope.get("nac_range") or scope.get("nac_code"),
-        "generated": "tabular",
-        "applied_filters": {k: v for k, v in filters.items() if v not in (None, "")},
-        "row_count": built["row_count"],
-        "total_amount": built["total_amount"],
-        "currency": built["currency"],
-        "contributing_databases": built["contributing_databases"],
-        "matched_on": sorted(scope),
-    }
-
-    evidence_id = repository.add_retrieved_evidence(
-        request_id,
-        document_id=f"GEN-{code}",
-        document_type=code,
-        identifier=identifier,
-        # Not a document from one system: it is derived from several.
-        source_database_id=GENERATED_SOURCE_ID,
-        source_file_path=None,
-        staged_file_path=built["staged_file_path"],
-        match_status="FOUND",
-        metadata=metadata,
-        pass_number=pass_number,
-    )
-
-    outcome.found[code] = {
-        "evidence_id": evidence_id,
-        "document_id": f"GEN-{code}",
-        "identifier": identifier,
-        "source_database_id": GENERATED_SOURCE_ID,
-        "staged_file_path": built["staged_file_path"],
-        "matched_on": sorted(scope),
-        "pass_number": pass_number,
-        "row_count": built["row_count"],
-    }
-    logger.info(
-        "Compiled %s: %d rows from %s",
-        code,
-        built["row_count"],
-        ", ".join(built["contributing_databases"]),
-    )
-
-
-def _tabular_identifier(context: dict[str, Any]) -> str:
-    """A short, stable identifier describing the extract's scope."""
-    parts: list[str] = []
-    period = context.get("period")
-    if period:
-        pieces = str(period).replace(",", " ").split()
-        parts.append("".join(pieces[-2:]) if len(pieces) >= 2 else str(period))
-    if context.get("sob"):
-        parts.append(f"SOB{context['sob']}")
-    nac = context.get("nac_range") or context.get("nac_code")
-    if nac:
-        parts.append(f"NAC{nac}")
-    if context.get("report_type"):
-        parts.append(str(context["report_type"]))
-    return "-".join(parts) if parts else "EXTRACT"
-
-
-async def _absorb_matches(
-    client,
-    request_id: str,
-    database_id: str,
-    result: dict[str, Any],
-    outcome: RetrievalOutcome,
-    pass_number: int,
-) -> list[str]:
-    """Stage and record each new match. Returns the evidence codes gained."""
-    newly_found: list[str] = []
-
-    for match in result.get("matches", []):
-        document_type = match.get("document_type")
-        if not document_type or document_type in outcome.found:
-            continue
-
-        retrieved = await client.retrieve_document(database_id, match["document_id"])
-        staged = staging.stage_document(
-            request_id,
-            document_id=match["document_id"],
-            document_type=document_type,
-            identifier=match.get("identifier"),
-            source_absolute_path=retrieved.get("absolute_path"),
-            source_relative_path=retrieved.get("file_path") or match.get("file_path"),
-            source_database_id=database_id,
-            metadata=match.get("metadata") or {},
-            matched_on=match.get("matched_on", []),
-        )
-
-        matched_on = match.get("matched_on", [])
-        evidence_id = repository.add_retrieved_evidence(
-            request_id,
-            document_id=match["document_id"],
-            document_type=document_type,
-            identifier=match.get("identifier"),
-            source_database_id=database_id,
-            source_file_path=retrieved.get("file_path") or match.get("file_path"),
-            staged_file_path=staged["staged_file_path"],
-            match_status="FOUND",
-            metadata={
-                **{key: match.get(key) for key in _EVIDENCE_FIELDS},
-                "title": (match.get("metadata") or {}).get("title"),
-                "content_summary": match.get("content_summary"),
-                "source_metadata": match.get("metadata") or {},
-                "matched_on": matched_on,
-                "staging_error": staged["error"],
-            },
-            pass_number=pass_number,
-        )
-
-        outcome.found[document_type] = {
-            "evidence_id": evidence_id,
-            "document_id": match["document_id"],
-            "identifier": match.get("identifier"),
-            "source_database_id": database_id,
-            "staged_file_path": staged["staged_file_path"],
-            "matched_on": matched_on,
-            "pass_number": pass_number,
-        }
-        newly_found.append(document_type)
-
-        # If this document was reachable only via an identifier learned from
-        # another source, remember which source that was. It is what lets the
-        # retry summary explain itself truthfully.
-        for key in matched_on:
-            origin = outcome.identifier_origin.get(key)
-            if origin:
-                outcome.unlocked_by[document_type] = origin
-                break
-
-    return newly_found
-
-
-def _enrich_context(
-    database_id: str, result: dict[str, Any], outcome: RetrievalOutcome
-) -> None:
-    """Fold identifiers discovered here into the context for later sources."""
-    for key, value in (result.get("discovered_identifiers") or {}).items():
-        if outcome.context.get(key) == value:
-            continue
-        outcome.context[key] = value
-        # First source to reveal a key owns it.
-        outcome.identifier_origin.setdefault(key, database_id)
+            val = str(val)
+            if key in user_supplied and str(user_supplied[key]) != val:
+                msg = (f"Identifier mismatch: {res.source_system} record references {key.replace('_', ' ')} {val}, "
+                       f"request specified {user_supplied[key]}")
+                raw.notes.append(msg)
+                warnings.append(msg)
+                continue
+            derived.setdefault((evidence_type, key), val)

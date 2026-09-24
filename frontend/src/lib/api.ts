@@ -1,107 +1,130 @@
-import type {
-  AuditRequestDetail,
-  AuditRequestSummary,
-  PackageView,
-  ReviewActionType,
-  UseCase,
-} from "./types";
-
-export const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+const TOKEN_KEY = 'aep.token'
 
 export class ApiError extends Error {
-  status: number;
-
-  constructor(message: string, status: number) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
+  status: number
+  code: string
+  constructor(status: number, code: string, message: string) {
+    super(message)
+    this.status = status
+    this.code = code
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  let response: Response;
+const REMEMBER_EMAIL_KEY = 'aep.remember-email'
+
+// The session lives only in this browser tab (sessionStorage), so opening the app or an email link in a
+// new tab/window always starts at the sign-in page. "Remember me" only remembers the email address.
+try { localStorage.removeItem(TOKEN_KEY) } catch { /* clear sessions persisted by earlier versions */ }
+
+export function getToken(): string | null {
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, {
-      ...init,
-      headers: {
-        "Content-Type": "application/json",
-        ...(init?.headers ?? {}),
-      },
-      cache: "no-store",
-    });
+    return sessionStorage.getItem(TOKEN_KEY)
   } catch {
-    throw new ApiError(
-      "Could not reach the backend. Confirm it is running on " + API_BASE_URL,
-      0,
-    );
+    return null
   }
+}
 
-  if (!response.ok) {
-    let detail = `Request failed with status ${response.status}`;
-    try {
-      const body = await response.json();
-      if (typeof body?.detail === "string") detail = body.detail;
-    } catch {
-      /* keep the default message */
-    }
-    throw new ApiError(detail, response.status);
+export function setToken(token: string | null) {
+  try {
+    sessionStorage.removeItem(TOKEN_KEY)
+    if (token) sessionStorage.setItem(TOKEN_KEY, token)
+  } catch {
+    /* storage unavailable */
   }
+}
 
-  if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+export function getRememberedEmail(): string {
+  try {
+    return localStorage.getItem(REMEMBER_EMAIL_KEY) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+export function setRememberedEmail(email: string | null) {
+  try {
+    if (email) localStorage.setItem(REMEMBER_EMAIL_KEY, email)
+    else localStorage.removeItem(REMEMBER_EMAIL_KEY)
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+let onUnauthorized: (() => void) | null = null
+export function setUnauthorizedHandler(fn: () => void) {
+  onUnauthorized = fn
+}
+
+async function request<T>(method: string, path: string, body?: unknown, isForm = false): Promise<T> {
+  const headers: Record<string, string> = {}
+  const token = getToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+  if (body !== undefined && !isForm) headers['Content-Type'] = 'application/json'
+  let res: Response
+  try {
+    res = await fetch(path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : isForm ? (body as FormData) : JSON.stringify(body),
+    })
+  } catch {
+    throw new ApiError(0, 'network', 'We could not reach the server. Check your connection and try again.')
+  }
+  if (res.status === 401 && !path.startsWith('/api/auth/login')) {
+    onUnauthorized?.()
+  }
+  const text = await res.text()
+  const data = text ? JSON.parse(text) : null
+  if (!res.ok) {
+    const err = data?.error ?? {}
+    throw new ApiError(res.status, err.code ?? 'error', err.message ?? 'Something went wrong. Please try again.')
+  }
+  return data as T
 }
 
 export const api = {
-  getUseCases: () => request<UseCase[]>("/api/use-cases"),
+  get: <T,>(p: string) => request<T>('GET', p),
+  post: <T,>(p: string, body?: unknown) => request<T>('POST', p, body ?? {}),
+  form: <T,>(p: string, fd: FormData) => request<T>('POST', p, fd, true),
+}
 
-  listRequests: () => request<AuditRequestSummary[]>("/api/audit-requests"),
+/** Authenticated URL for opening files/downloads in a new tab. */
+export function fileUrl(path: string): string {
+  const token = getToken()
+  const sep = path.includes('?') ? '&' : '?'
+  return token ? `${path}${sep}token=${encodeURIComponent(token)}` : path
+}
 
-  createRequest: (query: string) =>
-    request<{ request_id: string; status: string }>("/api/audit-requests", {
-      method: "POST",
-      body: JSON.stringify({ query }),
-    }),
+export function openFile(path: string) {
+  window.open(fileUrl(path), '_blank', 'noopener')
+}
 
-  getRequest: (requestId: string) =>
-    request<AuditRequestDetail>(`/api/audit-requests/${requestId}`),
+export function download(path: string) {
+  const a = document.createElement('a')
+  a.href = fileUrl(path)
+  a.rel = 'noopener'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+}
 
-  runRequest: (requestId: string) =>
-    request<AuditRequestDetail>(`/api/audit-requests/${requestId}/run`, {
-      method: "POST",
-    }),
-
-  retryRequest: (requestId: string) =>
-    request<AuditRequestDetail>(`/api/audit-requests/${requestId}/retry`, {
-      method: "POST",
-    }),
-
-  /** Answer a request that halted for missing mandatory inputs. */
-  clarify: (requestId: string, answer: string) =>
-    request<AuditRequestDetail>(`/api/audit-requests/${requestId}/clarify`, {
-      method: "POST",
-      body: JSON.stringify({ answer }),
-    }),
-
-  review: (
-    requestId: string,
-    action: ReviewActionType,
-    comment?: string,
-    reviewerName?: string,
-  ) =>
-    request<AuditRequestDetail>(`/api/audit-requests/${requestId}/review`, {
-      method: "POST",
-      body: JSON.stringify({
-        action,
-        comment: comment?.trim() ? comment.trim() : null,
-        reviewer_name: reviewerName ?? "J. Al-Farsi",
-      }),
-    }),
-
-  getPackage: (requestId: string) =>
-    request<PackageView>(`/api/audit-requests/${requestId}/package`),
-
-  /** Direct link used by the View actions; the browser opens it. */
-  evidenceFileUrl: (requestId: string, evidenceId: string) =>
-    `${API_BASE_URL}/api/audit-requests/${requestId}/evidence/${evidenceId}/file`,
-};
+/** Multipart upload with progress callback (XHR, since fetch has no upload progress). */
+export function uploadWithProgress<T>(path: string, fd: FormData, onProgress: (pct: number) => void): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', path)
+    const token = getToken()
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(Math.round((e.loaded / e.total) * 100))
+    xhr.onload = () => {
+      const data = xhr.responseText ? JSON.parse(xhr.responseText) : null
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data as T)
+      else {
+        if (xhr.status === 401) onUnauthorized?.()
+        reject(new ApiError(xhr.status, data?.error?.code ?? 'error', data?.error?.message ?? 'Upload failed.'))
+      }
+    }
+    xhr.onerror = () => reject(new ApiError(0, 'network', 'Upload failed — check your connection and retry.'))
+    xhr.send(fd)
+  })
+}

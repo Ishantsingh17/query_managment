@@ -1,92 +1,60 @@
-"""FastAPI application entry point.
-
-Local POC only: no authentication, no deployment concerns.
-"""
-
-from __future__ import annotations
-
+"""FastAPI entrypoint for the Audit Evidence Platform."""
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from observability import get_observability
 
-from app.api.routes import router
-from app.catalog.loader import enabled_databases, load_use_cases
-from app.config import get_settings
-from app.services import db
+from app.api import auth, dashboard, evidence, mcp_http, requests
+from app.core.config import get_settings
+from app.core.errors import install_error_handlers
+from app.core.logging import configure_logging
+from app.core.telemetry import setup_observability
+from app.db.seed_config import seed_config
+from app.db.session import create_schema, session_scope, validate_schema
+from app.mock_sources import store
+from app.mock_sources.api import router as mock_router
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-app = FastAPI(
-    title="Automated Audit Evidence Retrieval",
-    description="Turn an auditor's natural-language request into a validated evidence package.",
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    # Next falls back to 3001, 3002, ... when 3000 is taken, so allow the
-    # local dev range rather than a single port. Local POC only.
-    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):30\d{2}",
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.include_router(router)
+log = logging.getLogger(__name__)
 
 
-@app.on_event("startup")
-def on_startup() -> None:
+def bootstrap() -> None:
     settings = get_settings()
-    settings.ensure_directories()
-    db.initialize()
-
-    use_cases = load_use_cases()
-    databases = enabled_databases()
-    # Never log the API key itself, only whether one is present.
-    logger.info(
-        "Ready: %d use cases, %d searchable databases (%s), Groq=%s, model=%s, step delay=%dms",
-        len(use_cases),
-        len(databases),
-        ", ".join(db_spec.database_id for db_spec in databases),
-        "configured" if settings.groq_enabled else "not configured (rule-based fallback)",
-        settings.groq_model,
-        settings.demo_step_delay_ms,
-    )
-
-    missing = [
-        spec.database_id
-        for spec in databases
-        if not spec.resolved_path(settings.data_root).exists()
-    ]
-    if missing:
-        logger.warning(
-            "Database files missing for %s - run scripts/seed_databases.py", ", ".join(missing)
-        )
+    setup_observability()
+    for d in (settings.evidence_staging_dir, settings.packages_dir, settings.storage_dir / "db"):
+        d.mkdir(parents=True, exist_ok=True)
+    create_schema()
+    with session_scope() as s:
+        seed_config(s)
+    validate_schema()
+    store.seed_sources()
 
 
-@app.get("/health")
-def health() -> dict:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     settings = get_settings()
-    databases = enabled_databases()
-    return {
-        "status": "ok",
-        "use_cases": len(load_use_cases()),
-        "databases": [
-            {
-                "database_id": spec.database_id,
-                "search_order": spec.search_order,
-                "available": spec.resolved_path(settings.data_root).exists(),
-            }
-            for spec in databases
-        ],
-        "groq_configured": settings.groq_enabled,
-        "groq_model": settings.groq_model,
-        "demo_step_delay_ms": settings.demo_step_delay_ms,
-        "max_retries": settings.max_retries,
-    }
+    configure_logging(settings.log_level)
+    bootstrap()
+    log.info("Audit Evidence Platform started", extra={"event": "startup"})
+    yield
+    get_observability().shutdown()  # flush the local log and pending LangSmith batches
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(title=settings.app_name, version="1.0.0", lifespan=lifespan)
+    app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in settings.cors_origins.split(",")],
+                       allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+    install_error_handlers(app)
+    for r in (auth.router, requests.router, dashboard.router, evidence.router, mcp_http.router, mock_router):
+        app.include_router(r)
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    return app
+
+
+app = create_app()

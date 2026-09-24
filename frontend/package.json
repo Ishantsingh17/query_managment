@@ -1,27 +1,26 @@
 {
-  "name": "audit-evidence-frontend",
-  "version": "1.0.0",
+  "name": "audit-evidence-platform-web",
   "private": true,
+  "version": "1.0.0",
+  "type": "module",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint"
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b"
   },
   "dependencies": {
-    "lucide-react": "0.474.0",
-    "next": "15.5.25",
-    "react": "19.0.0",
-    "react-dom": "19.0.0"
+    "@fontsource/inter": "^5.3.0",
+    "lucide-react": "^1.47.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-router-dom": "^7.18.4"
   },
   "devDependencies": {
-    "@types/node": "22.10.7",
-    "@types/react": "19.0.7",
-    "@types/react-dom": "19.0.3",
-    "autoprefixer": "10.4.20",
-    "playwright": "^1.49.1",
-    "postcss": "^8.5.27",
-    "tailwindcss": "3.4.17",
-    "typescript": "5.7.3"
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
   }
 }

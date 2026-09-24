@@ -1,348 +1,178 @@
-# Automated Audit Evidence Retrieval — POC
+# Audit Evidence Platform
 
-Turns an auditor's natural-language request into a validated, reviewer-approved
-evidence package.
+End-to-end implementation of the Audit Evidence Platform described in `01_PRD` … `06_Implementation_Plan`, with the web UI built to match `UI_SCREENS/`.
 
 ```
-Auditor → FastAPI → LangGraph Orchestrator → Query Understanding (Groq)
-       → Requirement Catalog → Retrieval Agent → MCP Layer → SQLite DB-01…DB-04
-       → Evidence Staging → Validation → Retry → Package → Reviewer
+backend/   Python 3.13 · FastAPI · SQLAlchemy · SQLite · LangGraph orchestrator · MCP gateway · mock source APIs
+frontend/  React 19 · Vite · TypeScript · hand-built CSS design system (matches UI_SCREENS 01–12)
 ```
 
-Local only. No authentication, no deployment, synthetic data throughout.
+## Quick start (Windows / macOS / Linux)
 
----
-
-## Quick start
-
-`backend\.venv`, `frontend\node_modules`, the mock databases and the documents
-are **already set up**. To just run it, skip to *Run it* below.
-
-> **Never run `python -m venv .venv` while the backend is running.** On Windows
-> the live `python.exe` holds locks inside `.venv`, and recreating it mid-flight
-> leaves a broken environment (a missing `pyvenv.cfg` and a stripped
-> `Scripts\`). Stop the server first — see *If the venv breaks*.
-
-### Run it
-
-Two terminals, from the project root.
-
-**Terminal 1 — backend**
-
-```powershell
+```bash
+# 1. Backend
 cd backend
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
-```
+pip install -r requirements.txt
+python -m app.seed_demo --reset        # optional: demo data pushed through the real workflow
+python -m uvicorn app.main:app --port 8000
 
-**Terminal 2 — frontend**
-
-```powershell
-cd frontend
-npm run dev
-```
-
-Open <http://localhost:3000>. Check <http://127.0.0.1:8000/health> if anything
-looks unwired.
-
-### First-time setup (only if `.venv` is absent)
-
-```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-copy .env.example .env
-
-.\.venv\Scripts\python.exe scripts\seed_databases.py
-.\.venv\Scripts\python.exe scripts\init_app_state.py
-```
-
-```powershell
+# 2. Frontend (new terminal)
 cd frontend
 npm install
+npm run dev                            # http://localhost:5173  (proxies /api to :8000)
 ```
 
-### If the venv breaks
+On Windows you can run `start.ps1` from the repo root to launch both.
 
-Symptom: `failed to locate pyvenv.cfg: The system cannot find the file specified.`
+### Demo accounts (password `Password@123`)
 
-```powershell
-# 1. Stop anything holding the environment or the ports
-Get-Process python, node -ErrorAction SilentlyContinue | Stop-Process -Force
-
-# 2. Rebuild from scratch
-cd backend
-Remove-Item -Recurse -Force .venv
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-The generated data (`databases\`, `mock_documents\`, `app_state.sqlite`) lives
-outside `.venv` and survives this, so re-seeding is not required. To confirm the
-rebuild: `.\.venv\Scripts\python.exe -m pytest` should report 30 passed.
-
-To free the ports specifically:
-
-```powershell
-Get-NetTCPConnection -LocalPort 8000,3000 -State Listen -ErrorAction SilentlyContinue |
-  ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
-```
-
-### The demo query
-
-> Provide alternate testing documents for ABC Ltd, Invoice INV-12345.
-
-Expected: UC-04 → evidence found across DB-01, DB-02, DB-04 → SES missing →
-one retry finds it in DB-03 → validation COMPLETE → package → approve.
-
----
-
-## Configuration
-
-`backend/.env` (see `.env.example`):
-
-| Variable | Default | Purpose |
+| Role | Email | Lands on |
 |---|---|---|
-| `GROQ_API_KEY` | *(empty)* | Leave blank to use the deterministic rule-based parser. |
-| `GROQ_MODEL` | `openai/gpt-oss-120b` | Verified against this account. Model availability is per-key — list yours with the Groq SDK (see TEST_INPUTS.md). Tool calling is required, which rules out the `qwen` and `groq/compound` models. |
-| `MAX_RETRIES` | `2` | Bounds the retry loop. |
-| `DEMO_STEP_DELAY_MS` | `700` | Paces stages so `DB-01 → DB-04` is visibly sequential. Set `0` for instant runs and tests. |
+| Auditor | sarah.mitchell@company.com | Dashboard |
+| Human Validator | david.okafor@company.com | Evidence Review Queue |
+| Final Approver (SME) | priya.raman@company.com | Final Approval Queue |
 
-`NEXT_PUBLIC_API_BASE_URL` lives in `frontend/.env.local`.
+## Screen map
 
-CORS allows any `localhost`/`127.0.0.1` port in the `30xx` range, because
-Next falls back to 3001, 3002, ... when 3000 is already taken. If the UI
-reports *"Could not reach the backend"*, check which port Next actually
-started on — the message names the API base URL it tried.
+| Screen | Route | Role |
+|---|---|---|
+| 01 Login | `/login` | all |
+| 02 Auditor Dashboard | `/dashboard` | Auditor (SME gets a portfolio view) |
+| 03 Create Request | `/requests/new` | Auditor |
+| 04 Request Detail | `/requests/:id` | all |
+| 05 Evidence Review Queue | `/queue` | Validator |
+| 06 Validation Detail | `/queue/:id`, `/validation/requests/:id` | Validator |
+| 07 Final Approval Queue | `/approvals` | SME |
+| 08 Evidence Review Package | `/approvals/:id`, `/approvals/requests/:id` | SME |
+| 09 Approve / Reject dialogs | on 08 | SME |
+| 10 Final Response Package | `/requests/:id/package` (`/final`) | Auditor |
+| 11 Completed Requests | `/completed` | all |
+| 12 Status drawer | click a Request ID on the dashboard, or **View Timeline** | all |
 
-**Query Understanding has two paths.** Groq via `langchain-groq` with a Pydantic
-schema is primary. If the key is missing, the call fails, or the output does not
-satisfy the schema, a deterministic regex parser takes over and the UI labels the
-parse as rule-based. The demo cannot be blocked by network or quota.
+Also: Requests grid, Reports, Settings (source-system status), Help Center, global search (⌘K / Ctrl+K), notification bell.
 
----
+## Stakeholder configuration (authoritative)
 
-## How the interesting parts work
+Loaded from `backend/app/db/stakeholder_config.py` into SQLite on startup (`python -m app.db.seed_config` re-applies it and removes any row that isn't in it):
 
-### No evidence-to-system mapping
+| Query Type | Evidence required (Requirement Catalog) | Retrieval parameters (from the registry keys) |
+|---|---|---|
+| Trade Payables Balance Confirmation | Vendor-wise payable balance, Ageing, Signed confirmation letter, APTB ledger extract, Vendor contact details | Vendor ID |
+| Balance Confirmation – Alternate Testing | Invoice, PO, GRN/SES | Invoice Number (or Payment Document Number) |
+| Payment Report / Payment Testing | Payment report, Invoice, PO, GRN/SES, Approval, Payment advice / UTR, Accounting entries | Payment Document Number |
+| Bank Portal / Payment Process Walkthrough | Signatory email approval, IPAMS approval, Board Resolution limits | Payment Document Number, Fiscal Year |
 
-The POC does not know which database holds which evidence. It walks the sources
-in `app/catalog/databases.yaml` order, asks each only for what is still missing,
-and folds every strong identifier it discovers into the search context so later
-sources can be queried with keys the original request never contained.
+- `requirement_catalog` (exact 4 fields) says **what** is required. `evidence_source_registry` (exact 7 fields) says **where and how** to retrieve it. The stakeholder automation text and classification keywords live in a separate `query_type_definitions` table.
+- Search / Retrieval Keys grammar: `A / B` = either key; `A, B` = both keys; `PO Number [from INVOICE]` = may come from the request, or from the retrieved invoice. Code only derives a key where the registry states it this way.
+- **Source systems:** only Invoice→GROSS, PO→ARIBA, GRN/SES→GESS and Approval→IPAMS are documented, in the App Flow. The other registry rows are marked as development placeholders pending stakeholder confirmation; change them in the config file, not in code.
 
-The four sources present as **Oracle ERP**, **SAP Ariba**, **Sharepoint** and
-**DB-04**. Their ids (`DB-01`…`DB-04`) stay stable internally; renaming them in
-the registry changes every label in the UI.
+## Architecture (backend)
 
-### Some evidence is compiled, not retrieved
+```
+API (FastAPI, role checks in backend)
+ └─ Orchestrator (LangGraph state graph, app/orchestrator/graph.py)
+     understand → classify → resolve_requirements → resolve_sources → plan → retrieve → process → validate
+        ├─ complete   → Evidence Review Package → notify SME
+        └─ incomplete → REWORK_REQUIRED → Validator: retry | manual upload | accept not required → continue
+     SME approve → Final Response Package (approved evidence only, sealed with SHA-256) → notify auditor → COMPLETED
+     SME reject  → REJECTED → REWORK_REQUIRED
+```
 
-Not every required item is a document sitting in a source system. UC-01's sixth
-item, **GL Transaction Listing (Excel)**, is the underlying row-level data:
-the GL lines scoped to the requested period, SOB, NAC range **and report
-type**, gathered from all four sources through MCP and written as a single
-`.xlsx` with a criteria header, frozen panes, an auto-filter and a total row.
-An AP request yields ~44 AP lines out of the 131 in period/SOB/NAC scope.
-
-The catalog marks it `generated: tabular`, which tells the Retrieval Agent to
-**build** it rather than search for a file. From that point it is
-indistinguishable from a retrieved document: it stages, validates, appears in
-the evidence table and ships in the package ZIP.
-
-Because it has no single source system it is recorded against a synthetic
-`GENERATED` id, shown as **Compiled extract**, with the contributing databases,
-row count and total value in its metadata. Its row fetches are deliberately
-excluded from the per-database match counts — otherwise "2 matches" would
-become "35 matches" and mean nothing.
-
-> **report_type filters the extract but NOT the documents.** An AP cost drill
-> request still *requires* the AP, AR and Others reports as documents, so the
-> shared matcher deliberately ignores `report_type`. The transaction listing
-> behind that same request should hold AP lines only, so the filter is applied
-> as a separate exact-match layer on the `fetch_transactions` MCP tool. Leaking
-> it into the matcher would stop an AP request ever finding the AR and Others
-> documents, and the checklist could never complete — there is a test guarding
-> exactly that.
-
-> **One subtlety worth knowing.** Aggregates are compiled against the
-> auditor's *stated* scope, never the enriched search context. Identifier
-> enrichment is right for correlating documents (find the PO for this invoice)
-> but wrong here: a `vendor_id` harvested mid-run once narrowed the listing
-> from 131 rows to 57 without any error. `scope_context` is threaded through
-> the agent specifically to prevent that, and a test asserts the sheet contains
-> every in-scope row and only SOB 101 / NAC 5000-5999.
-
-To add tabular evidence to another use case, declare it in `use_cases.yaml`
-with `generated: tabular`. No code change.
-
-### Mandatory inputs are enforced before any search
-
-A request can be understood and still be unsearchable. `"Provide cost drill
-report for August 2026."` classifies correctly as UC-01, but a cost drill needs
-**SOB, NAC range and report type** to select the right documents. Searching on
-period alone does not fail loudly — against a real ERP it returns whichever
-document came back first, presented as validated evidence. Wrong, confidently.
-
-So `check_required_inputs` compares the parsed parameters against the use
-case's `required_parameters` and, if any are absent, **halts before touching a
-source system**: status `NEEDS_INPUT`, zero databases searched, and a question
-put to the auditor.
-
-The answer is free text. It is appended to the request and the whole thing is
-re-parsed, so `"SOB 101, NAC 5000-5999, AP"` fills the gaps. A partial answer
-narrows the question instead of restarting it, and retrieval resumes
-automatically once every mandatory input is known. `raw_query` is never
-rewritten — clarifications are recorded separately so the trail stays honest.
-
-This applies to all four use cases, driven entirely by the catalog:
-
-| Use case | Mandatory inputs |
+| Component | Location |
 |---|---|
-| UC-01 | period, sob, nac_range, report_type |
-| UC-02 | account, period |
-| UC-03 | period *(vendor/sample optional)* |
-| UC-04 | vendor_name, invoice_number |
+| Config tables (exact 4- and 7-field schemas) + seed | `app/db/models.py`, `app/db/seed_config.py` (validated at startup) |
+| Request DB (7 agreed tables + `users`, `request_events`) | `app/db/models.py` → `storage/db/audit_evidence.sqlite` |
+| Query Understanding / Classification | `app/agents/query_understanding.py`, `classification.py` |
+| LLM provider | `app/agents/llm.py` — `groq` (GROQ_API_KEY, `openai/gpt-oss-120b`), `langchain` (any init_chat_model string) or `rules` |
+| Agentic Retrieval Agent (LLM tool-calling over MCP, guard-railed) | `app/agents/llm_retrieval_agent.py` |
+| Registry resolution + Retrieval Planning | `app/registry/resolution.py`, `app/agents/retrieval_planning.py` |
+| Retrieval Agent (key dependencies, alternative / corroborating sources, retries) | `app/agents/retrieval_agent.py` |
+| MCP gateway + 9 source connectors | `app/mcp/` — also exposed as JSON-RPC `POST /mcp` (`tools/list`, `tools/call`) |
+| Mock source APIs (Oracle, GRS, VMS, GESS, LMS, ARIBA, GPS, GROSS, IPAMS) | `app/mock_sources/` → `storage/db/source_mocks.sqlite`, `/mock-api/{source}/{object}` |
+| Extraction / Normalization / Canonical Evidence / Staging | `app/evidence/` → `storage/evidence_staging/<request_id>/{original,normalized,manual_uploads}` |
+| Completeness validation | `app/validation/engine.py` (pluggable extra rules) |
+| Packages | `app/packages/builder.py` → `storage/packages/<request_id>/` |
+| Gmail notifications | `app/notifications/service.py` |
 
-### The retry is structural, not scripted
+### Swapping to real source APIs (plan step 14)
+Point `AEP_SOURCE_API_BASE_URL` at the real gateway and adjust each connector's `base_path` / `auth_headers()` in `app/mcp/connectors.py`. The MCP tool contract, Retrieval Agent and Registry stay unchanged; registry rows carry the endpoint path (`… - GET /invoices`).
 
-For the demo query, `DB-03` holds the SES document keyed **only** on
-`ses_number` — every other identifier column is NULL. `ses_number` is not
-knowable until `DB-04` (searched *after* DB-03) reveals it on the supporting
-document. So:
+### LLM agents (Groq)
+With `GROQ_API_KEY` and `AEP_LLM_PROVIDER=groq` in `backend/.env`:
+- **Query Understanding + Classification**: the LLM extracts identifiers and picks exactly one query type from the stakeholder Query Type Definitions, or flags ambiguity (enforced by the schema). Identifiers not literally present in the request are discarded. The rationale appears in the request's Activity trail.
+- **Agentic Retrieval**: the LLM calls the `RetrieveEvidence` MCP tool, choosing call order, deriving keys from earlier results and falling back to alternative sources. Guardrails reject sources outside the retrieval plan, wrong key names, invented identifier values, early alternative calls, and repeated calls; there's also a step budget.
+- **Fallbacks**: any LLM error falls back to the deterministic agents. The LLM runs once per **Analyse request** click; its result is reused when the request is submitted. The demo seeder always uses rules.
+- Set `AEP_LLM_AGENTIC_RETRIEVAL=false` to keep LLM classification with deterministic retrieval.
 
-| Pass | What happens |
+### LLM observability
+`backend/observability/` is a standalone, reusable package with no audit logic and no dependency on `app`. Agents call its generic API only. Events go to one local file, `backend/logs/llm_observability.jsonl`, and optionally to LangSmith (`LANGSMITH_TRACING=true` plus `LANGSMITH_API_KEY`). Each event covers one of: an LLM call (tokens, latency, errors), a rules-based or deterministic fallback, an agent step, an MCP tool call, a retry, or the validation result. All of them correlate by request id. Prompt and response capture is off by default, and redaction always runs first.
+```
+python -m observability.query logs/llm_observability.jsonl --request-id AUD-2026-1001   # from backend/
+```
+See [backend/observability/README.md](backend/observability/README.md) for configuration and for reusing it in other apps.
+
+### Email notifications
+Notifications go to the Human Validator (evidence missing, or SME rejection), the SME (review package ready) and the Auditor (final package approved); see the table below. Test any configuration with:
+```
+python -m app.notifications.test_email you@example.com
+```
+**Option A: Gmail SMTP + App Password** (`AEP_NOTIFICATION_PROVIDER=gmail`). Needs outbound TCP 465 or 587. These ports are blocked on the current corporate network.
+1. On the sender Google account, turn on 2-Step Verification (myaccount.google.com → Security).
+2. Create an App Password at myaccount.google.com/apppasswords and copy the 16 characters.
+3. Set `AEP_GMAIL_APP_PASSWORD=...` and `AEP_NOTIFICATION_PROVIDER=gmail`.
+
+**Option B: Gmail API over HTTPS** (`AEP_NOTIFICATION_PROVIDER=gmail_api`). Uses only port 443, so it works on this network.
+1. console.cloud.google.com → create a project → APIs & Services → Library → enable **Gmail API**.
+2. OAuth consent screen (Google Auth Platform): User type **External**, app name "Audit Evidence Platform", add the sender Gmail under **Test users**.
+3. Clients → Create client → **Desktop app** → download the JSON.
+4. `python -m app.notifications.gmail_oauth_setup C:\Users\you\Downloads\client_secret.json`. Sign in as the sender and allow "Send email". The script saves the credentials to `backend/.env` and switches the provider.
+5. Restart the backend and run the test command.
+
+While the OAuth app is in "Testing", Google expires refresh tokens after 7 days. Re-run step 4, or publish the app, for a long-lived token.
+
+For both options, set `AEP_NOTIFICATION_RECIPIENT_OVERRIDE=<your inbox>`, because the demo users' `@company.com` addresses are fictional. Every delivery attempt is recorded in `notification_events` (SENT / LOGGED / FAILED) and shown under the notification bell. A failed send never blocks the workflow.
+
+## Mock data scenarios
+
+| Query | Scenario |
 |---|---|
-| 1 | Oracle ERP → Invoice, GRN · SAP Ariba → PO · Sharepoint → **nothing** · DB-04 → Supporting Doc, which reveals `ses_number = SES-455` |
-| — | Validation returns `INCOMPLETE` (SES missing) |
-| 2 | Re-search with the enriched context → Sharepoint hits |
+| Payment testing, doc `1900004533` | **A** complete, and **D** multi-source: 7 items from ORACLE, GROSS, ARIBA, GESS, IPAMS, GPS |
+| Payment testing, doc `1900004521` | **B** approval missing → Rework Required → validator email → manual upload |
+| Payment testing, doc `1900004552` | **C** GRN posted late → **Retry** retrieves it |
+| Any request + `POST /mock-api/_admin/sources/GPS/availability?available=false` | **E** source outage → retryable, recovers after retry |
+| Payment testing, doc `1900004560` | Invoice references a PO that ARIBA doesn't hold |
+| Balance confirmation, vendor `1004821` / `1004877` | Complete / confirmation letter not received |
+| Alternate testing, `INV-2026-08560` / `INV-2026-08533` | Complete (with SES) / PO and GRN missing |
+| Walkthrough, doc `1900004533` + `FY2026` / doc `1900004521` + `FY2026` | Complete / IPAMS approval missing |
 
-`retry_count = 1` falls out of real mechanics, with no special-casing anywhere.
+The late-GRN scenario (C) only works once after a reset: `python -m app.seed_demo --reset`, with the backend stopped.
 
-> The mockup's caption says SES was recovered "via related identifiers from
-> DB-01". That is not reachable: whichever source reveals the key must be
-> searched *after* DB-03, or the first pass would already find it. The app
-> generates this sentence from recorded state, so it says DB-04 — the source
-> that actually supplied the key.
+## Conversational intake
 
-### MCP layer
+Create Request is a conversation. The auditor describes the need, the platform shows its **Request Understanding** (Query Type, extracted parameters, evidence requested, required and missing parameters, status), and then:
+- if everything is present, **Submit request** starts retrieval;
+- if a mandatory parameter is missing, it asks for it (e.g. *"…but I need the Payment Document Number to continue"*) and re-checks once supplied;
+- if the request matches more than one Query Type, the auditor picks one; if it matches none, it lists the supported types.
 
-`app/mcp_layer/server.py` is the only module that opens a source database. It
-exposes `search_sqlite_database`, `get_document_metadata` and
-`retrieve_document` over a real MCP client/server pair using the SDK's
-in-memory transport, so tool calls are genuine JSON-RPC round trips with no
-subprocess to supervise. `retrieval_agent.py` never imports `sqlite3`.
+The API enforces the same rules: `POST /api/requests` returns 422 unless the understanding is READY.
 
-### One payload per screen
+## Email notifications and login-first links
 
-`GET /api/audit-requests/{id}` returns everything the detail screen renders,
-including a backend-computed `timeline[]`. The number of database steps derives
-from the registry, so changing `databases.yaml` changes the UI with no frontend
-edit. The frontend holds no workflow logic.
+| Event | Recipient | Link |
+|---|---|---|
+| Evidence missing / unclear, or SME rejection | Human Validator | `/login?next=/validation/requests/{id}` |
+| Evidence Review Package ready | SME | `/login?next=/approvals/requests/{id}` |
+| Final Response Package approved | Auditor | `/login?next=/requests/{id}/package` |
 
----
+Every link lands on the common sign-in page. After sign-in, the backend checks `next` against the user's role and access to that request (`POST /api/auth/login`, `GET /api/auth/resolve-next`). Wrong-role, foreign or external targets go to the user's home instead.
 
-## API
-
-| Endpoint | Purpose |
-|---|---|
-| `POST /api/audit-requests` | `{query}` → `{request_id, status}` |
-| `GET /api/audit-requests` | List, for the Requests screen |
-| `GET /api/audit-requests/{id}` | Composite state the UI polls |
-| `POST /api/audit-requests/{id}/run` | Start the workflow (background) |
-| `POST /api/audit-requests/{id}/retry` | Retry missing evidence |
-| `POST /api/audit-requests/{id}/clarify` | `{answer}` — supply missing mandatory inputs and resume |
-| `POST /api/audit-requests/{id}/review` | `{action: APPROVE\|REJECT\|RETRY, comment}` |
-| `GET /api/audit-requests/{id}/package` | Summary, contents, review trail |
-| `GET /api/audit-requests/{id}/package/download` | The whole package as a ZIP — what **Open Package** serves |
-| `GET /api/audit-requests/{id}/package/files` | JSON manifest: absolute path and file list |
-| `GET /api/audit-requests/{id}/evidence/{evid}/file` | Serves a staged document |
-| `GET /api/use-cases` | The four catalog entries |
-| `GET /health` | Config and database availability |
-
-Interactive docs at <http://127.0.0.1:8000/docs>.
-
----
-
-## Screens
-
-| Route | Screen |
-|---|---|
-| `/audit` | Audit Request |
-| `/requests` | Requests list |
-| `/requests/{id}` | Detail & progress |
-| `/requests/{id}/review` | Reviewer |
-| `/requests/{id}/package` | Final package |
-| `/use-cases` | Use case catalog |
-
----
+For development, set `AEP_NOTIFY_VALIDATOR_EMAIL`, `AEP_NOTIFY_SME_EMAIL` and `AEP_NOTIFY_AUDITOR_EMAIL`; these take precedence over `AEP_NOTIFICATION_RECIPIENT_OVERRIDE`.
 
 ## Tests
 
-```powershell
-cd backend
-.\.venv\Scripts\python.exe -m pytest
+```bash
+cd backend && python -m pytest -q      # 108 tests: unit, connector contract, MCP, end-to-end + failure paths, observability
+cd frontend && npm run build           # typecheck + production build
 ```
 
-30 tests covering TC-01…TC-10, the mandatory-input gate, the
-clarify-and-resume turn and the compiled Excel extract, plus invariants (source documents never mutated,
-retry bounded, package reproducible, evidence files confined to their request).
-Each run uses a throwaway data root with freshly seeded databases.
-
-Against a running server, all four use cases and the error paths:
-
-```powershell
-.\.venv\Scripts\python.exe scripts\verify_all_use_cases.py
-```
-
-Diagnostics: `probe_search.py` (replays the two-pass search),
-`probe_workflow.py` (full workflow, no API), `probe_api.py` (every endpoint).
-
-Screens, for visual comparison against `UI_SCREENS/`:
-
-```powershell
-cd frontend
-node scripts\screenshot.mjs <REQUEST_ID> ..\screenshots
-```
-
----
-
-## Layout
-
-```
-backend/
-  app/
-    catalog/       use_cases.yaml + databases.yaml (the Requirement Catalog)
-    mcp_layer/     MCP server, client, matching rules
-    agents/        query understanding (+ rule fallback), retrieval agent
-    graph/         LangGraph state, nodes, workflow
-    services/      state db, repository, staging, validation, packaging, runner
-    api/           routes + composite view builders
-  scripts/         seeding, init, probes, verification
-  tests/           TC-01 … TC-10
-  databases/       db01…db04.sqlite          (generated)
-  mock_documents/  synthetic PDFs            (generated)
-  evidence_staging/{request_id}/             (generated)
-  final_audit_packages/{request_id}/         (generated)
-frontend/src/
-  app/             routes
-  components/      cards, tables, timeline, badges
-  lib/             api client, types, polling hook, formatting
-```
-
-Generated directories are safe to delete; re-run the two seed scripts.
-
----
-
-## Notes
-
-- **Source documents are never modified.** Staging and packaging copy only, and
-  a test asserts source mtimes are unchanged.
-- **Secrets are never logged.** Startup reports only whether a key is present.
-- `npm audit` reports two advisories against the `postcss` copy bundled inside
-  `next`. They concern processing untrusted CSS, which this app never does, and
-  clearing them requires a breaking upgrade to Next 16. The direct `postcss`
-  dependency is patched.
-- Out of scope per the specs: authentication, deployment, real enterprise
-  connections, evidence-to-system mapping, and any LLM-authored audit judgement.
-  UC-02's long-outstanding explanation is surfaced as human-required and is
-  never generated.
+Covered: all four stakeholder Query Types; natural-language classification (identified, ambiguous, unsupported); Requirement Catalog and Registry lookups with exact schemas; missing-parameter and conversational follow-up; complete and missing retrieval; validator, SME and auditor emails; manual upload; retry; accept-not-required; SME approval and rejection; Final Response Package with approved evidence only; common-login and role-safe redirects; unauthorised access; duplicate requests; source outage; package-generation failure and regeneration; documented-dependency-only key derivation; LLM agents with guardrails and fallbacks.
