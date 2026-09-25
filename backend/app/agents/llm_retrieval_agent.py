@@ -71,17 +71,14 @@ class AgenticRetrievalAgent(RetrievalAgent):
                 result = self._agentic(plan, parameters, agent)
                 agent.annotate(llm_used=True, mode="agentic", found=sum(r.found for r in result[0]))
                 return result
-            except Exception as exc:
+            except Exception:
                 log.warning("agentic retrieval failed; using deterministic executor", exc_info=True)
-                return self._fallback(plan, parameters, "llm_error", agent, exc)
+                return self._fallback(plan, parameters, "llm_error", agent)
 
-    def _fallback(self, plan, parameters, reason: str, agent, error: BaseException | None = None):
-        obs = get_observability()
-        obs.log_fallback_started(component=COMPONENT, operation=OPERATION, fallback_type=FALLBACK, reason=reason,
-                                 error=error)
+    def _fallback(self, plan, parameters, reason: str, agent):
+        # Any real LLM failure was already recorded with its true error by the failing obs.llm_call span
+        # (sent to every active sink, including LangSmith when tracing is on); nothing to add here.
         result = super().execute(plan, parameters)
-        obs.log_fallback_completed(component=COMPONENT, operation=OPERATION, fallback_type=FALLBACK, reason=reason,
-                                   found=sum(r.found for r in result[0]), evidence_types=len(result[0]))
         agent.annotate(llm_used=False, mode=FALLBACK, fallback_reason=reason, found=sum(r.found for r in result[0]))
         return result
 

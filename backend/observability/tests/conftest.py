@@ -56,8 +56,8 @@ def langsmith_capture(monkeypatch):
     import langsmith
     posts: list[dict] = []
     patches: list[dict] = []
-    monkeypatch.setattr(langsmith.Client, "_create_run", lambda self, rc: posts.append(rc))
-    monkeypatch.setattr(langsmith.Client, "_update_run", lambda self, ru: patches.append(ru))
+    monkeypatch.setattr(langsmith.Client, "_create_run", lambda self, rc, **_: posts.append(rc))
+    monkeypatch.setattr(langsmith.Client, "_update_run", lambda self, ru, **_: patches.append(ru))
 
     def runs() -> dict[str, dict]:
         by: dict[str, dict] = {}

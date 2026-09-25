@@ -125,7 +125,6 @@ def test_query_understanding_llm_call_appears_with_usage(env, obs_log, auditor):
     assert call["parent_run_id"] == agent["run_id"] and call["trace_id"] == agent["trace_id"]
     done = next(e for e in ev if e["event_type"] == "agent_completed" and e["run_id"] == agent["run_id"])
     assert done["attributes"]["llm_used"] is True and done["attributes"]["method"] == "llm"
-    assert not of(ev, "llm_fallback_started", component="query_understanding_agent")
     raw = obs_log["path"].read_text(encoding="utf-8")
     assert PAYMENT_A not in raw and "Payment document sample." not in raw  # capture disabled by default
 
@@ -136,16 +135,12 @@ def test_rules_based_fallback_visible_when_llm_disabled(env, obs_log, auditor):
     rid = submit(env["client"], auditor, PAYMENT_A)  # tests run with AEP_LLM_PROVIDER=rules
     ev = obs_log["read"](rid)
     assert not [e for e in ev if e["run_type"] == "llm"]  # nothing pretends to be an LLM run
-    started = of(ev, "llm_fallback_started", component="query_understanding_agent")
-    completed = of(ev, "llm_fallback_completed", component="query_understanding_agent")
-    assert started and completed
-    assert {e["fallback_type"] for e in started + completed} == {"rules_based"}
-    assert {e["reason"] for e in started + completed} == {"llm_disabled"}
-    assert all(e["trace_id"] in bound_traces(ev, rid) for e in started + completed)
-    retrieval = of(ev, "llm_fallback_completed", component="retrieval_agent")
-    assert retrieval and retrieval[0]["fallback_type"] == "deterministic_executor"
     qu_done = next(e for e in ev if e["event_type"] == "agent_completed" and e["name"] == "query_understanding_agent")
     assert qu_done["attributes"]["llm_used"] is False and qu_done["attributes"]["fallback_reason"] == "llm_disabled"
+    retrieval_done = of(ev, "agent_completed", component="retrieval_agent")
+    assert retrieval_done and retrieval_done[0]["attributes"]["mode"] == "deterministic_executor"
+    assert retrieval_done[0]["attributes"]["fallback_reason"] == "llm_disabled"
+    assert all(e["trace_id"] in bound_traces(ev, rid) for e in [qu_done, *retrieval_done])
 
 
 # ---- 28. Retrieval planning / agentic retrieval LLM steps -----------------------------------------------
@@ -271,11 +266,11 @@ def test_llm_failure_falls_back_and_workflow_continues(env, obs_log, auditor):
     ev = obs_log["read"](rid)
     qu_failed = of(ev, "llm_call_failed", component="query_understanding_agent")
     assert qu_failed and qu_failed[0]["error_type"] == "TimeoutError" and qu_failed[0]["latency_ms"] >= 0
-    fb = of(ev, "llm_fallback_started", component="query_understanding_agent")
-    assert fb[0]["reason"] == "llm_error" and fb[0]["error_type"] == "TimeoutError" and fb[0]["fallback_type"] == "rules_based"
-    assert of(ev, "llm_fallback_completed", component="query_understanding_agent")[0]["workflow_continued"] is True
+    qu_done = next(e for e in ev if e["event_type"] == "agent_completed" and e["name"] == "query_understanding_agent")
+    assert qu_done["attributes"]["llm_used"] is False and qu_done["attributes"]["fallback_reason"] == "llm_error"
     assert of(ev, "llm_call_failed", component="retrieval_agent")
-    assert of(ev, "llm_fallback_completed", component="retrieval_agent", reason="llm_error")
+    retrieval_done = of(ev, "agent_completed", component="retrieval_agent")
+    assert retrieval_done and retrieval_done[0]["attributes"]["fallback_reason"] == "llm_error"
     assert of(ev, "workflow_completed", name="audit_evidence_workflow")
     assert env["client"].get(f"/api/requests/{rid}", headers=auditor).json()["status"] == "REVIEW_READY"
 
@@ -317,8 +312,8 @@ def test_app_secrets_never_appear_even_with_capture_enabled(env, obs_log, audito
 def test_langsmith_trace_hierarchy_for_workflow(env, obs_log, auditor, monkeypatch):
     import langsmith
     posts, patches = [], []
-    monkeypatch.setattr(langsmith.Client, "_create_run", lambda self, rc: posts.append(rc))
-    monkeypatch.setattr(langsmith.Client, "_update_run", lambda self, ru: patches.append(ru))
+    monkeypatch.setattr(langsmith.Client, "_create_run", lambda self, rc, **_: posts.append(rc))
+    monkeypatch.setattr(langsmith.Client, "_update_run", lambda self, ru, **_: patches.append(ru))
     manager = obs_log["reconfigure"](LANGSMITH_TRACING="true", LANGSMITH_API_KEY=LS_KEY, LANGSMITH_PROJECT="aep-tests")
     settings, redactor = manager.settings, manager.redactor
     configure_observability(settings, redactor=redactor, sinks=[

@@ -17,9 +17,6 @@ class EventType(str, Enum):
     LLM_CALL_COMPLETED = "llm_call_completed"
     LLM_CALL_FAILED = "llm_call_failed"
 
-    LLM_FALLBACK_STARTED = "llm_fallback_started"
-    LLM_FALLBACK_COMPLETED = "llm_fallback_completed"
-
     TOOL_CALL_STARTED = "tool_call_started"
     TOOL_CALL_COMPLETED = "tool_call_completed"
     TOOL_CALL_FAILED = "tool_call_failed"

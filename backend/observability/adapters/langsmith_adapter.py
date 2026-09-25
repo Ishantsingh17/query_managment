@@ -35,7 +35,7 @@ _STATE_KEY = "langsmith"
 # span lifecycle event values (plain strings: str-Enum members hash by name, so never mix them in sets)
 _LIFECYCLE = frozenset(e.value for group in SPAN_EVENTS.values() for e in group)
 # event fields worth copying onto LangSmith run events / metadata
-_EVENT_FIELDS = ("reason", "outcome", "fallback_type", "retry_number", "retry_count", "previous_error_type",
+_EVENT_FIELDS = ("reason", "outcome", "retry_number", "retry_count", "previous_error_type",
                  "error_type", "error_message", "linked_trace_id", "request_id", "component", "operation", "status")
 
 
@@ -201,10 +201,7 @@ class LangSmithSink(ObservabilitySink):
         run.add_event({"name": enum_value(event.event_type), "time": iso_utc(event.timestamp),
                        "kwargs": to_jsonable({**fields, **(event.attributes or {})}, 500)})
         et = event.event_type
-        if et in (EventType.LLM_FALLBACK_STARTED, EventType.LLM_FALLBACK_COMPLETED):
-            run.add_metadata({"llm_fallback_type": event.fallback_type, "llm_fallback_reason": event.reason})
-            run.add_tags(["llm_fallback"])
-        elif et in (EventType.RETRY_STARTED, EventType.RETRY_COMPLETED):
+        if et in (EventType.RETRY_STARTED, EventType.RETRY_COMPLETED):
             run.add_tags(["retry"])
         elif et == EventType.CORRELATION_LINKED and event.request_id:
             for s in [span, *span.ancestors()]:

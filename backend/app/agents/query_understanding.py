@@ -76,9 +76,6 @@ def understand_query(text: str, known_identifiers: dict[str, Any] | None = None,
     obs = get_observability()
     with obs.agent(QU_COMPONENT, operation=QU_OPERATION) as agent:
         sq, fallback_reason = _understand(text, known_identifiers, supported, use_llm)
-        if fallback_reason is not None and use_llm:
-            obs.log_fallback_completed(component=QU_COMPONENT, operation=QU_OPERATION, fallback_type="rules_based",
-                                       reason=fallback_reason, parameter_count=len(sq.parameters))
         agent.annotate(method=sq.method, llm_used=sq.method == "llm", fallback_reason=fallback_reason,
                        parameter_names=sorted(sq.parameters), ambiguous_candidates=len(sq.ambiguous_between))
         return sq

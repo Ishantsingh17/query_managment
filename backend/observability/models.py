@@ -115,8 +115,6 @@ class ObservabilityEvent(BaseModel):
     previous_error_type: str | None = None
     reason: str | None = None
     outcome: str | None = None
-    fallback_type: str | None = None
-    workflow_continued: bool | None = None
 
     # payloads (present only when capture is enabled; always redacted first)
     input_captured: bool | None = None

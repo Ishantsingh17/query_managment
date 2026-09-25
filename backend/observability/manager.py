@@ -487,24 +487,6 @@ class ObservabilityManager:
 
     log_retry = log_retry_started
 
-    def log_fallback_started(self, *, component: str, fallback_type: str, reason: str, operation: str | None = None,
-                             error: BaseException | None = None, provider: str | None = None, model: str | None = None,
-                             **attributes: Any) -> None:
-        """The LLM path was abandoned (disabled / unavailable / failed) and a fallback takes over."""
-        et, msg = describe_error(error)
-        self._safe_point(EventType.LLM_FALLBACK_STARTED, status=Status.INFO, component=component, operation=operation,
-                         fallback_type=fallback_type, reason=reason, error_type=et, error_message=msg,
-                         provider=provider, model=model, attributes=attributes or None)
-
-    def log_fallback_completed(self, *, component: str, fallback_type: str, reason: str | None = None,
-                               operation: str | None = None, workflow_continued: bool = True,
-                               success: bool = True, **attributes: Any) -> None:
-        """The fallback produced its result. Makes it explicit that no LLM produced this output."""
-        self._safe_point(EventType.LLM_FALLBACK_COMPLETED, status=Status.SUCCESS if success else Status.FAILED,
-                         component=component, operation=operation, fallback_type=fallback_type, reason=reason,
-                         workflow_continued=workflow_continued, outcome="success" if success else "failed",
-                         attributes=attributes or None)
-
     def log_validation(self, name: str, *, outcome: str, component: str | None = None, **attributes: Any) -> None:
         """A validation / guardrail / quality-check result."""
         self._safe_point(EventType.VALIDATION_EVENT, status=Status.INFO, name=name, component=component or name,
@@ -653,11 +635,60 @@ class ObservabilityManager:
                 span.error = error
             failed = error is not None or span.status_override == Status.FAILED.value
             started, completed, failed_type = SPAN_EVENTS[span.run_type]
+            # The workflow that started this trace ("one run"): attach the whole-run roll-up before it ends.
+            # Scoped to workflow roots specifically (never llm/tool, which carry no descendants of their own)
+            # so the summary always reflects every call made during the run, never omitting its own span.
+            if span.run_type == RunType.WORKFLOW and span.run_id == span.trace_id:
+                span.attributes.update(self._trace_summary_attributes(span))
             event = self._span_event(span, failed_type if failed else completed,
                                      Status.FAILED if failed else Status.SUCCESS, end=True)
+            self._accumulate_trace(span, event)
             self._dispatch(event, span, phase="end")
         except Exception as exc:  # noqa: BLE001
             self._internal_error(f"end {span.run_type.value}", exc)
+
+    def _accumulate_trace(self, span: Span, event: ObservabilityEvent) -> None:
+        """Roll this span's contribution into its trace's running totals, read back by the root span's summary."""
+        trace = span.trace
+        if span.run_type == RunType.LLM:
+            usage = None
+            if event.input_tokens is not None or event.output_tokens is not None or event.total_tokens is not None:
+                usage = TokenUsage(input_tokens=event.input_tokens, output_tokens=event.output_tokens,
+                                   total_tokens=event.total_tokens, cached_tokens=event.cached_tokens,
+                                   reasoning_tokens=event.reasoning_tokens,
+                                   source=event.usage_source or UsageSource.PROVIDER)
+            with trace.lock:
+                trace.llm_calls += 1
+                if usage is not None and not usage.is_empty:
+                    trace.usage = usage if trace.usage is None else trace.usage + usage
+                if event.estimated_cost is not None:
+                    trace.estimated_cost = (trace.estimated_cost or 0.0) + event.estimated_cost
+                    trace.cost_currency = event.cost_currency
+        elif span.run_type == RunType.TOOL:
+            with trace.lock:
+                trace.tool_calls += 1
+        elif span.run_type == RunType.AGENT:
+            with trace.lock:
+                trace.agent_calls += 1
+
+    def _trace_summary_attributes(self, span: Span) -> dict[str, Any]:
+        """Whole-run totals for the trace this (root) span belongs to."""
+        trace = span.trace
+        with trace.lock:
+            usage, cost, currency = trace.usage, trace.estimated_cost, trace.cost_currency
+            llm_calls, tool_calls, agent_calls = trace.llm_calls, trace.tool_calls, trace.agent_calls
+        attrs: dict[str, Any] = {"trace_llm_calls": llm_calls, "trace_tool_calls": tool_calls,
+                                 "trace_agent_calls": agent_calls, "trace_duration_ms": trace.elapsed_ms()}
+        if usage is not None and not usage.is_empty:
+            attrs.update(trace_input_tokens=usage.input_tokens, trace_output_tokens=usage.output_tokens,
+                         trace_total_tokens=usage.total_tokens)
+            if usage.cached_tokens:
+                attrs["trace_cached_tokens"] = usage.cached_tokens
+            if usage.reasoning_tokens:
+                attrs["trace_reasoning_tokens"] = usage.reasoning_tokens
+        if cost is not None:
+            attrs["trace_estimated_cost"], attrs["trace_cost_currency"] = round(cost, 6), currency
+        return attrs
 
     def _span_event(self, span: Span, event_type: EventType, status: Status, end: bool = False) -> ObservabilityEvent:
         s = self.settings

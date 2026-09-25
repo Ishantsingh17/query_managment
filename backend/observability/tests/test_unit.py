@@ -303,18 +303,6 @@ def test_retry_events_stay_in_trace_and_mark_nested_calls(make_obs, read):
     assert one(ev, "tool_call_started")["retry_count"] == 1
 
 
-def test_rules_based_fallback_is_explicit(make_obs, read):
-    obs = make_obs()
-    with obs.agent("query_understanding", request_id="REQ-1001"):
-        obs.log_fallback_started(component="query_understanding", fallback_type="rules_based", reason="llm_disabled")
-        obs.log_fallback_completed(component="query_understanding", fallback_type="rules_based", reason="llm_disabled")
-    ev = read(obs)
-    start, done = one(ev, "llm_fallback_started"), one(ev, "llm_fallback_completed")
-    assert start["fallback_type"] == done["fallback_type"] == "rules_based" and start["reason"] == "llm_disabled"
-    assert done["workflow_continued"] is True and done["request_id"] == "REQ-1001"
-    assert not by_type(ev, "llm_call_started")  # a rules-based execution is never reported as an LLM call
-
-
 # ---- 15. configuration ------------------------------------------------------------------------------
 
 def test_configuration_loading(monkeypatch, tmp_path):

@@ -26,6 +26,18 @@ class TraceState:
     request_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Trace-wide roll-up: updated as each LLM/tool/agent span in the trace ends, read once when the
+    # trace's root span ends to attach a whole-run summary (total tokens, cost, call counts, duration).
+    start_perf: float = field(default_factory=perf_ms, repr=False)
+    usage: TokenUsage | None = None
+    estimated_cost: float | None = None
+    cost_currency: str | None = None
+    llm_calls: int = 0
+    tool_calls: int = 0
+    agent_calls: int = 0
+
+    def elapsed_ms(self) -> float:
+        return round(max(0.0, perf_ms() - self.start_perf), 3)
 
 
 @dataclass

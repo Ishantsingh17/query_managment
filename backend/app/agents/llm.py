@@ -6,7 +6,10 @@
 
 Outputs are always validated against controlled values (the Requirement Catalog); any failure
 falls back to the rules engine so the workflow never depends on the LLM being available.
-Every LLM call and every rules-based fallback is reported through the generic observability API.
+With `groq`/`langchain` configured, the call is attempted even without credentials, so a real
+provider/auth failure happens and is traced (observability `llm_call` span, and LangSmith when
+tracing is on) rather than assumed locally. Every LLM call is reported through the generic
+observability API.
 """
 import logging
 from typing import Literal
@@ -22,12 +25,11 @@ _model_override = None  # tests inject a fake chat model here
 
 
 def llm_enabled() -> bool:
-    s = get_settings()
+    """True whenever a real LLM provider is configured. Credentials are not checked here: the call is still
+    attempted without them so a genuine provider/auth failure is made and traced, rather than assumed locally."""
     if _model_override is not None:
         return True
-    if s.llm_provider == "groq":
-        return bool(s.groq_api_key)
-    return s.llm_provider == "langchain" and bool(s.llm_model)
+    return get_settings().llm_provider in ("groq", "langchain")
 
 
 def set_chat_model(model) -> None:
@@ -114,11 +116,9 @@ def llm_extract_detailed(text: str, supported: dict[str, str] | None = None
                          ) -> tuple[LlmQueryExtraction | None, str | None]:
     """(extraction, fallback_reason). `fallback_reason` is None when the LLM result is usable, otherwise
     "llm_disabled" | "llm_error" and the caller continues with the rules engine."""
-    obs = get_observability()
     if not llm_enabled():
-        obs.log_fallback_started(component=QU_COMPONENT, operation=QU_OPERATION, fallback_type="rules_based",
-                                 reason="llm_disabled")
         return None, "llm_disabled"
+    obs = get_observability()
     supported = supported or {}
     provider, model_name = llm_identity()
     try:
@@ -137,8 +137,8 @@ def llm_extract_detailed(text: str, supported: dict[str, str] | None = None
             call.set_output(result.model_dump())
             call.set_parsed(True)
         return result, None
-    except Exception as exc:  # provider/network/validation failure -> deterministic fallback
+    except Exception:  # provider/network/validation failure -> deterministic fallback
+        # The failing obs.llm_call span above already recorded the real error (type, message, provider,
+        # model) to every active sink, including LangSmith when tracing is on; nothing to add here.
         log.warning("LLM extraction failed; falling back to rules", exc_info=True)
-        obs.log_fallback_started(component=QU_COMPONENT, operation=QU_OPERATION, fallback_type="rules_based",
-                                 reason="llm_error", error=exc, provider=provider, model=model_name)
         return None, "llm_error"
