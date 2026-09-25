@@ -12,7 +12,17 @@ frontend/  React 19 · Vite · TypeScript · hand-built CSS design system (match
 ```bash
 # 1. Backend
 cd backend
+python -m venv .venv
+```
+
+Activate it — Windows (PowerShell): `.\.venv\Scripts\Activate.ps1` — macOS/Linux: `source .venv/bin/activate`.
+Every `pip`/`python` command below assumes it's active in that terminal; a fresh venv is required because the
+project's dependencies (e.g. `langchain-groq`, only needed once `AEP_LLM_PROVIDER=groq`) are declared in
+`requirements.txt`, not preinstalled anywhere.
+
+```bash
 pip install -r requirements.txt
+copy .env.example .env                 # macOS/Linux: cp .env.example .env — then fill in your keys
 python -m app.seed_demo --reset        # optional: demo data pushed through the real workflow
 python -m uvicorn app.main:app --port 8000
 
@@ -22,7 +32,8 @@ npm install
 npm run dev                            # http://localhost:5173  (proxies /api to :8000)
 ```
 
-On Windows you can run `start.ps1` from the repo root to launch both.
+On Windows you can run `start.ps1` from the repo root to launch both — it expects `backend/.venv` to already
+exist (run the backend setup above at least once first) and activates it for you.
 
 ### Demo accounts (password `Password@123`)
 
