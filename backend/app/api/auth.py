@@ -20,10 +20,14 @@ _RID = r"(?P<rid>AUD-\d{4}-\d+)"
 _COMMON = [r"/completed", r"/reports", r"/settings", r"/help"]
 # Destinations each role may be redirected to after sign-in (the API enforces access again on every call).
 ROUTES = {
+    # /requests/{rid} (the auditor's own request detail) is deliberately AUDITOR-only here: it is the
+    # auditor's actionable page, ownership-checked below. A validator/SME arriving via a stale or
+    # generic next-link must land on their own actionable page instead (queue / approvals), not this
+    # read-only auditor view — see resolve_next's wrong_role fallback, which already handles this
+    # correctly for every other cross-role route.
     "AUDITOR": [r"/dashboard", r"/requests", r"/requests/new", rf"/requests/{_RID}", rf"/requests/{_RID}/(package|final)"],
-    "VALIDATOR": [r"/queue", rf"/queue/{_RID}", rf"/validation/requests/{_RID}", r"/requests", rf"/requests/{_RID}"],
-    "SME": [r"/dashboard", r"/approvals", rf"/approvals/{_RID}", rf"/approvals/requests/{_RID}", r"/requests",
-            rf"/requests/{_RID}"],
+    "VALIDATOR": [r"/queue", rf"/queue/{_RID}", rf"/validation/requests/{_RID}", r"/requests"],
+    "SME": [r"/dashboard", r"/approvals", rf"/approvals/{_RID}", rf"/approvals/requests/{_RID}", r"/requests"],
 }
 
 
