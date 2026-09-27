@@ -18,7 +18,6 @@ from observability import get_observability
 from sqlalchemy.orm import Session
 
 from app.agents.classification import classify_query
-from app.agents.llm import llm_enabled
 from app.agents.query_understanding import understand_query
 from app.core.labels import query_type_label
 from app.core.models import StructuredQuery
@@ -53,16 +52,16 @@ def _join(items: list[str]) -> str:
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
-def analyze_request(session: Session, query: str, identifiers: dict[str, Any], user_query_type: str | None,
-                    use_llm: bool = True) -> dict:
-    key = hashlib.sha256(json.dumps([query.strip(), identifiers, user_query_type, use_llm and llm_enabled()],
+def analyze_request(session: Session, query: str, identifiers: dict[str, Any], user_query_type: str | None) -> dict:
+    """Raises LlmUnavailableError (HTTP 503 with a user-facing message) when the LLM fails; nothing is cached then."""
+    key = hashlib.sha256(json.dumps([query.strip(), identifiers, user_query_type],
                                     sort_keys=True).encode()).hexdigest()
     hit = _CACHE.get(key)
     if hit and time.time() - hit[0] < _CACHE_TTL:
         return hit[1]
 
     definitions = query_type_definitions(session)
-    sq = understand_query(query, identifiers, query_type_catalog(session), use_llm=use_llm)
+    sq = understand_query(query, identifiers, query_type_catalog(session))
     c = classify_query(sq, definitions, user_query_type or None)
     params = {k: v for k, v in sq.parameters.items() if v not in (None, "")}
     period = _period_text(params)

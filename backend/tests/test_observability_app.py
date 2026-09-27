@@ -44,10 +44,11 @@ class ScriptedChat(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=msg)])
 
 
-def qu_reply(query_type=PT, rationale="Payment document sample."):
+def qu_reply(query_type=PT, rationale="Payment document sample.", payment_document_number="1900004533"):
     return AIMessage("", usage_metadata=dict(USAGE), tool_calls=[{
         "name": "AuditQueryExtraction", "id": "qu-1",
-        "args": {"query_type": query_type, "classification_rationale": rationale}}])
+        "args": {"query_type": query_type, "classification_rationale": rationale,
+                 "payment_document_number": payment_document_number}}])
 
 
 def retrieval_turns():
@@ -129,18 +130,16 @@ def test_query_understanding_llm_call_appears_with_usage(env, obs_log, auditor):
     assert PAYMENT_A not in raw and "Payment document sample." not in raw  # capture disabled by default
 
 
-# ---- 27. rules-based fallback -------------------------------------------------------------------------
+# ---- 27. no rules-based fallback: a missing LLM is an error, and it is traced ----------------------
 
-def test_rules_based_fallback_visible_when_llm_disabled(env, obs_log, auditor):
-    rid = submit(env["client"], auditor, PAYMENT_A)  # tests run with AEP_LLM_PROVIDER=rules
-    ev = obs_log["read"](rid)
-    assert not [e for e in ev if e["run_type"] == "llm"]  # nothing pretends to be an LLM run
-    qu_done = next(e for e in ev if e["event_type"] == "agent_completed" and e["name"] == "query_understanding_agent")
-    assert qu_done["attributes"]["llm_used"] is False and qu_done["attributes"]["fallback_reason"] == "llm_disabled"
-    retrieval_done = of(ev, "agent_completed", component="retrieval_agent")
-    assert retrieval_done and retrieval_done[0]["attributes"]["mode"] == "deterministic_executor"
-    assert retrieval_done[0]["attributes"]["fallback_reason"] == "llm_disabled"
-    assert all(e["trace_id"] in bound_traces(ev, rid) for e in [qu_done, *retrieval_done])
+def test_no_llm_configured_is_reported_and_traced(env, obs_log, auditor):
+    llm.set_chat_model(None)  # tests run with AEP_LLM_PROVIDER=none
+    r = env["client"].post("/api/requests", headers=auditor, json={"query": PAYMENT_A})
+    assert r.status_code == 503 and r.json()["error"]["code"] == "llm_not_configured"
+    ev = obs_log["read"]()
+    failed = of(ev, "agent_failed", name="query_understanding_agent")
+    assert failed and failed[0]["error_type"] == "LlmUnavailableError"
+    assert of(ev, "workflow_failed", name="request_intake")
 
 
 # ---- 28. Retrieval planning / agentic retrieval LLM steps -----------------------------------------------
@@ -260,19 +259,16 @@ def test_retries_stay_linked_to_request_and_trace(env, obs_log, auditor, validat
 
 # ---- LLM failure / fallback workflow ----------------------------------------------------------------
 
-def test_llm_failure_falls_back_and_workflow_continues(env, obs_log, auditor):
+def test_llm_failure_is_reported_to_user_and_traced(env, obs_log, auditor):
     llm.set_chat_model(ScriptedChat(fail=True))
-    rid = submit(env["client"], auditor, PAYMENT_A)
-    ev = obs_log["read"](rid)
+    r = env["client"].post("/api/requests", headers=auditor, json={"query": PAYMENT_A})
+    assert r.status_code == 503 and r.json()["error"]["code"] == "llm_unavailable"
+    assert "did not respond in time" in r.json()["error"]["message"]
+    ev = obs_log["read"]()
     qu_failed = of(ev, "llm_call_failed", component="query_understanding_agent")
     assert qu_failed and qu_failed[0]["error_type"] == "TimeoutError" and qu_failed[0]["latency_ms"] >= 0
-    qu_done = next(e for e in ev if e["event_type"] == "agent_completed" and e["name"] == "query_understanding_agent")
-    assert qu_done["attributes"]["llm_used"] is False and qu_done["attributes"]["fallback_reason"] == "llm_error"
-    assert of(ev, "llm_call_failed", component="retrieval_agent")
-    retrieval_done = of(ev, "agent_completed", component="retrieval_agent")
-    assert retrieval_done and retrieval_done[0]["attributes"]["fallback_reason"] == "llm_error"
-    assert of(ev, "workflow_completed", name="audit_evidence_workflow")
-    assert env["client"].get(f"/api/requests/{rid}", headers=auditor).json()["status"] == "REVIEW_READY"
+    assert of(ev, "agent_failed", name="query_understanding_agent")
+    assert env["client"].get("/api/requests", headers=auditor).json()["items"] == []  # no request was created
 
 
 # ---- missing evidence workflow ----------------------------------------------------------------------

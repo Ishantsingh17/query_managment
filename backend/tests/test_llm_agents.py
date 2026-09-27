@@ -5,6 +5,7 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from app.agents import llm
+from app.agents.llm import LlmUnavailableError
 from app.agents.llm_retrieval_agent import AgenticRetrievalAgent
 from app.agents.query_understanding import understand_query
 from app.agents.retrieval_planning import build_plan
@@ -80,9 +81,9 @@ def test_llm_classification_constrained_to_catalog(fake):
 
 def test_llm_schema_rejects_query_types_outside_catalog(fake):
     fake(FakeChat(structured={"query_type": "TRAVEL_EXPENSE"}))
-    with session_scope() as s:
-        sq = understand_query("Pull the receipts for E-20413", None, query_type_catalog(s))
-    assert sq.method == "rules" and sq.query_type is None  # schema validation failed -> deterministic fallback
+    with session_scope() as s, pytest.raises(LlmUnavailableError) as err:
+        understand_query("Pull the receipts for E-20413", None, query_type_catalog(s))
+    assert "could not be used" in err.value.message  # schema validation failed -> no rules fallback
 
 
 def test_llm_ambiguity_is_surfaced(fake, auditor):
@@ -100,11 +101,34 @@ def test_llm_cannot_inject_identifiers_absent_from_text(fake):
     assert "payment_document_number" not in sq.parameters
 
 
-def test_llm_failure_falls_back_to_rules(fake):
+def test_llm_failure_raises_instead_of_rules_fallback(fake):
     fake(FakeChat(fail=True))
-    with session_scope() as s:
-        sq = understand_query("Payment testing for payment document 1900004533", None, query_type_catalog(s))
-    assert sq.method == "rules" and sq.parameters["payment_document_number"] == "1900004533"
+    with session_scope() as s, pytest.raises(LlmUnavailableError) as err:
+        understand_query("Payment testing for payment document 1900004533", None, query_type_catalog(s))
+    assert err.value.status_code == 503 and err.value.code == "llm_unavailable"
+
+
+def test_llm_rate_limit_gets_a_clear_message(fake):
+    class RateLimitError(Exception):
+        status_code = 429
+
+    class Limited(FakeChat):
+        def with_structured_output(self, schema):
+            class _S:
+                def invoke(self, messages):
+                    raise RateLimitError("Rate limit reached for model openai/gpt-oss-120b")
+            return _S()
+    fake(Limited())
+    with session_scope() as s, pytest.raises(LlmUnavailableError) as err:
+        understand_query("Payment testing for payment document 1900004533", None, query_type_catalog(s))
+    assert "usage limit" in err.value.message
+
+
+def test_no_llm_configured_is_an_error(env):
+    llm.set_chat_model(None)  # conftest runs with AEP_LLM_PROVIDER=none
+    with session_scope() as s, pytest.raises(LlmUnavailableError) as err:
+        understand_query("Payment testing for payment document 1900004533", None, query_type_catalog(s))
+    assert err.value.code == "llm_not_configured"
 
 
 def test_agentic_retrieval_uses_documented_dependency_and_guardrails(fake):
@@ -139,7 +163,8 @@ def test_agentic_retrieval_falls_back_when_llm_errors(fake):
 
 
 def test_full_workflow_with_llm_agents(env, fake, auditor):
-    fake(FakeChat(structured={"query_type": PT, "classification_rationale": "Payment document sample."},
+    fake(FakeChat(structured={"query_type": PT, "classification_rationale": "Payment document sample.",
+                              "payment_document_number": "1900004533"},
                   turns=[AIMessage("", tool_calls=[call(1, "INVOICE", "GROSS", payment_document_number="1900004533")]),
                          AIMessage("Invoice retrieved; remaining items left to the executor.")]))
     c = env["client"]

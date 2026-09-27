@@ -9,7 +9,9 @@ _TMP = Path(tempfile.mkdtemp(prefix="aep-test-"))
 os.environ["AEP_STORAGE_DIR"] = str(_TMP)
 os.environ["AEP_MOCK_LATENCY_MS"] = "0"
 os.environ["AEP_NOTIFICATION_PROVIDER"] = "console"
-os.environ["AEP_LLM_PROVIDER"] = "rules"
+# No real LLM provider in tests (never spend quota / hit the network); a deterministic fake model is injected below.
+os.environ["AEP_LLM_PROVIDER"] = "none"
+os.environ["GROQ_API_KEY"] = ""
 # Observability: local JSONL in a temp dir (outside AEP_STORAGE_DIR, which is wiped per test); never send to LangSmith.
 _OBS_TMP = Path(tempfile.mkdtemp(prefix="aep-obs-"))
 os.environ["OBSERVABILITY_LOG_FILE"] = str(_OBS_TMP / "llm_observability.jsonl")
@@ -22,6 +24,7 @@ for _k in ("AEP_NOTIFICATION_RECIPIENT_OVERRIDE", "AEP_NOTIFY_VALIDATOR_EMAIL", 
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app.agents import llm  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 from app.db import session as db_session  # noqa: E402
 from app.main import app, bootstrap  # noqa: E402
@@ -29,6 +32,7 @@ from app.mcp.gateway import McpGateway, set_gateway  # noqa: E402
 from app.mock_sources import store  # noqa: E402
 from app.notifications import service as notif  # noqa: E402
 from app.orchestrator import intake  # noqa: E402
+from tests.fake_llm import FakeLLM  # noqa: E402
 
 PASSWORD = "Password@123"
 
@@ -45,6 +49,14 @@ class RecordingProvider:
         if self.fail:
             raise RuntimeError("SMTP unavailable")
         self.sent.append({"to": recipient, "subject": subject, "text": text, "html": html})
+
+
+@pytest.fixture(autouse=True)
+def fake_llm():
+    """Every test gets the deterministic fake LLM unless it installs its own model."""
+    llm.set_chat_model(FakeLLM())
+    yield
+    llm.set_chat_model(None)
 
 
 @pytest.fixture()

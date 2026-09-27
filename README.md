@@ -94,7 +94,7 @@ API (FastAPI, role checks in backend)
 | Config tables (exact 4- and 7-field schemas) + seed | `app/db/models.py`, `app/db/seed_config.py` (validated at startup) |
 | Request DB (7 agreed tables + `users`, `request_events`) | `app/db/models.py` → `storage/db/audit_evidence.sqlite` |
 | Query Understanding / Classification | `app/agents/query_understanding.py`, `classification.py` |
-| LLM provider | `app/agents/llm.py` — `groq` (GROQ_API_KEY, `openai/gpt-oss-120b`), `langchain` (any init_chat_model string) or `rules` |
+| LLM provider | `app/agents/llm.py` — `groq` (GROQ_API_KEY, `openai/gpt-oss-120b`), `langchain` (any init_chat_model string). An LLM is required; there is no rules mode |
 | Agentic Retrieval Agent (LLM tool-calling over MCP, guard-railed) | `app/agents/llm_retrieval_agent.py` |
 | Registry resolution + Retrieval Planning | `app/registry/resolution.py`, `app/agents/retrieval_planning.py` |
 | Retrieval Agent (key dependencies, alternative / corroborating sources, retries) | `app/agents/retrieval_agent.py` |
@@ -112,11 +112,11 @@ Point `AEP_SOURCE_API_BASE_URL` at the real gateway and adjust each connector's 
 With `GROQ_API_KEY` and `AEP_LLM_PROVIDER=groq` in `backend/.env`:
 - **Query Understanding + Classification**: the LLM extracts identifiers and picks exactly one query type from the stakeholder Query Type Definitions, or flags ambiguity (enforced by the schema). Identifiers not literally present in the request are discarded. The rationale appears in the request's Activity trail.
 - **Agentic Retrieval**: the LLM calls the `RetrieveEvidence` MCP tool, choosing call order, deriving keys from earlier results and falling back to alternative sources. Guardrails reject sources outside the retrieval plan, wrong key names, invented identifier values, early alternative calls, and repeated calls; there's also a step budget.
-- **Fallbacks**: any LLM error falls back to the deterministic agents. The LLM runs once per **Analyse request** click; its result is reused when the request is submitted. The demo seeder always uses rules.
+- **No rules-based fallback for understanding**: if the Query Understanding LLM fails (API / rate limit, auth, timeout, unusable output), the auditor gets a clear message (HTTP 503 `llm_unavailable`) and no request is created. The error is recorded on the `llm_call` span in `backend/logs/llm_observability.jsonl` and in LangSmith. If the agentic retrieval LLM fails, the deterministic executor still runs the registry plan. The LLM runs once per **Analyse request** click; its result is reused when the request is submitted. The demo seeder also uses the LLM.
 - Set `AEP_LLM_AGENTIC_RETRIEVAL=false` to keep LLM classification with deterministic retrieval.
 
 ### LLM observability
-`backend/observability/` is a standalone, reusable package with no audit logic and no dependency on `app`. Agents call its generic API only. Events go to one local file, `backend/logs/llm_observability.jsonl`, and optionally to LangSmith (`LANGSMITH_TRACING=true` plus `LANGSMITH_API_KEY`). Each event covers one of: an LLM call (tokens, latency, errors), a rules-based or deterministic fallback, an agent step, an MCP tool call, a retry, or the validation result. All of them correlate by request id. Prompt and response capture is off by default, and redaction always runs first.
+`backend/observability/` is a standalone, reusable package with no audit logic and no dependency on `app`. Agents call its generic API only. Events go to one local file, `backend/logs/llm_observability.jsonl`, and optionally to LangSmith (`LANGSMITH_TRACING=true` plus `LANGSMITH_API_KEY`). Each event covers one of: an LLM call (tokens, latency, errors such as rate limits), a deterministic retrieval fallback, an agent step, an MCP tool call, a retry, or the validation result. All of them correlate by request id. Prompt and response capture is off by default, and redaction always runs first.
 ```
 python -m observability.query logs/llm_observability.jsonl --request-id AUD-2026-1001   # from backend/
 ```

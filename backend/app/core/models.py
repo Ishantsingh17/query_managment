@@ -14,7 +14,7 @@ class StructuredQuery(BaseModel):
     source_text: str
     requested_evidence: list[str] = Field(default_factory=list)
     confidence: float = 0.0
-    method: str = "rules"
+    method: str = "llm"
     rationale: str | None = None
     ambiguous_between: list[str] = Field(default_factory=list)
 

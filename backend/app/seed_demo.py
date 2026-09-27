@@ -60,7 +60,6 @@ def run(reset: bool) -> None:
         for sub in ("db", "evidence_staging", "packages"):
             shutil.rmtree(settings.storage_dir / sub, ignore_errors=True)
     settings.mock_latency_ms = 0
-    settings.llm_provider = "rules"  # demo scenarios stay deterministic and don't spend LLM quota
     settings.notification_provider = "console"  # seeding must not send real emails
     bootstrap()
     if reset:

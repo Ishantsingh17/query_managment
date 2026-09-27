@@ -1,15 +1,13 @@
 """LLM provider abstraction (configuration-driven, TRD §2).
 
-`rules`     — deterministic built-in agents (no external calls).
 `groq`      — ChatGroq with GROQ_API_KEY (default model openai/gpt-oss-120b).
 `langchain` — any provider supported by LangChain's init_chat_model, e.g. AEP_LLM_MODEL="openai:gpt-4.1".
 
-Outputs are always validated against controlled values (the Requirement Catalog); any failure
-falls back to the rules engine so the workflow never depends on the LLM being available.
-With `groq`/`langchain` configured, the call is attempted even without credentials, so a real
-provider/auth failure happens and is traced (observability `llm_call` span, and LangSmith when
-tracing is on) rather than assumed locally. Every LLM call is reported through the generic
-observability API.
+Outputs are always validated against controlled values (the Requirement Catalog). There is no rules-based
+fallback: any LLM failure (rate limit / API limit, auth, timeout, invalid output) raises `LlmUnavailableError`,
+which the API returns to the user as a clear message. The call is attempted even without credentials, so a real
+provider/auth failure happens and is traced (observability `llm_call` span -> local JSONL file, and LangSmith when
+tracing is on) rather than assumed locally. Every LLM call is reported through the generic observability API.
 """
 import logging
 from typing import Literal
@@ -18,10 +16,31 @@ from observability import get_observability
 from pydantic import BaseModel, Field, create_model
 
 from app.core.config import get_settings
+from app.core.errors import AppError
 
 log = logging.getLogger(__name__)
 
 _model_override = None  # tests inject a fake chat model here
+
+
+class LlmUnavailableError(AppError):
+    """The LLM could not produce a usable answer; the request cannot be understood without it."""
+    status_code = 503
+    code = "llm_unavailable"
+
+
+def _describe_failure(exc: Exception) -> str:
+    name = type(exc).__name__
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 429 or "RateLimit" in name:
+        return "The AI service's usage limit was reached. Please wait a minute and try again."
+    if status in (401, 403) or "Authentication" in name or "PermissionDenied" in name:
+        return "The AI service rejected the credentials. Check the LLM API key in backend/.env."
+    if "Timeout" in name:
+        return "The AI service did not respond in time. Please try again."
+    if "ValidationError" in name or "OutputParser" in name:
+        return "The AI service returned an answer that could not be used. Please try again or rephrase the request."
+    return f"The AI service is unavailable right now ({name}). Please try again."
 
 
 def llm_enabled() -> bool:
@@ -107,17 +126,12 @@ SYSTEM_PROMPT = (
 )
 
 
-def llm_extract(text: str, supported: dict[str, str] | None = None) -> LlmQueryExtraction | None:
-    """`supported` maps query type code -> description of what it covers (from the Requirement Catalog)."""
-    return llm_extract_detailed(text, supported)[0]
-
-
-def llm_extract_detailed(text: str, supported: dict[str, str] | None = None
-                         ) -> tuple[LlmQueryExtraction | None, str | None]:
-    """(extraction, fallback_reason). `fallback_reason` is None when the LLM result is usable, otherwise
-    "llm_disabled" | "llm_error" and the caller continues with the rules engine."""
+def llm_extract(text: str, supported: dict[str, str] | None = None) -> LlmQueryExtraction:
+    """`supported` maps query type code -> description of what it covers (from the Requirement Catalog).
+    Raises LlmUnavailableError when no LLM is configured or the call fails."""
     if not llm_enabled():
-        return None, "llm_disabled"
+        raise LlmUnavailableError("No LLM provider is configured. Set AEP_LLM_PROVIDER to groq or langchain "
+                                  "in backend/.env.", code="llm_not_configured")
     obs = get_observability()
     supported = supported or {}
     provider, model_name = llm_identity()
@@ -136,9 +150,9 @@ def llm_extract_detailed(text: str, supported: dict[str, str] | None = None
             result = LlmQueryExtraction(**out.model_dump())
             call.set_output(result.model_dump())
             call.set_parsed(True)
-        return result, None
-    except Exception:  # provider/network/validation failure -> deterministic fallback
+        return result
+    except Exception as exc:  # provider/network/rate-limit/validation failure -> surfaced to the user
         # The failing obs.llm_call span above already recorded the real error (type, message, provider,
-        # model) to every active sink, including LangSmith when tracing is on; nothing to add here.
-        log.warning("LLM extraction failed; falling back to rules", exc_info=True)
-        return None, "llm_error"
+        # model) to every active sink — the local JSONL file and LangSmith when tracing is on.
+        log.error("LLM query understanding failed", exc_info=True)
+        raise LlmUnavailableError(_describe_failure(exc)) from exc

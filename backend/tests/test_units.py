@@ -14,8 +14,8 @@ from app.db.session import get_engine, session_scope
 from app.db.stakeholder_config import QUERY_TYPE_DEFINITIONS, REQUIREMENT_CATALOG
 from app.mcp.connectors import ConnectorResult
 from app.mcp.gateway import get_gateway
-from app.registry.resolution import (endpoint_path, key_to_param, parse_keys, query_type_definitions,
-                                     resolve_requirements, resolve_source_mappings)
+from app.registry.resolution import (endpoint_path, key_to_param, parse_keys, query_type_catalog,
+                                     query_type_definitions, resolve_requirements, resolve_source_mappings)
 from app.validation.engine import validate_completeness
 
 STAKEHOLDER_TYPES = {"TRADE_PAYABLES_BALANCE_CONFIRMATION", "BALANCE_CONFIRMATION_ALTERNATE_TESTING",
@@ -25,6 +25,11 @@ STAKEHOLDER_TYPES = {"TRADE_PAYABLES_BALANCE_CONFIRMATION", "BALANCE_CONFIRMATIO
 def defs():
     with session_scope() as s:
         return query_type_definitions(s)
+
+
+def catalog():
+    with session_scope() as s:
+        return query_type_catalog(s)
 
 
 # ---- Configuration -------------------------------------------------------------------------------
@@ -116,7 +121,7 @@ def test_query_understanding_extracts_parameters():
     ("Vendor master review for vendor 1004821", None, "unsupported"),
 ])
 def test_natural_language_query_type_identification(env, text, expected, status):
-    c = classify_query(understand_query(text), defs())
+    c = classify_query(understand_query(text, None, catalog()), defs())
     assert (c.query_type, c.status) == (expected, status)
 
 

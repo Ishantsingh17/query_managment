@@ -34,8 +34,8 @@ class Settings(BaseSettings):
     # Retrieval / retry policy (configurable, per TRD §7)
     retrieval_max_attempts: int = 2
 
-    # LLM. "rules" = deterministic built-in agents; "groq" = ChatGroq; "langchain" = init_chat_model(llm_model)
-    llm_provider: str = "rules"
+    # LLM (required — there is no rules-based mode). "groq" = ChatGroq; "langchain" = init_chat_model(llm_model)
+    llm_provider: str = "groq"
     llm_model: str = "openai/gpt-oss-120b"
     llm_timeout_seconds: float = 30.0
     # When the LLM is enabled, let the Retrieval Agent drive MCP tool calls (deterministic fallback always kept)
